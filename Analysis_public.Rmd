@@ -1,0 +1,1252 @@
+---
+title: "Irradiation induced mutagenesis"
+output: html_notebook
+---
+
+In this notebook, I will analyse and visualise the mutational signatures of ionising radiation in DNA repair proficient and deficient **C. elegans**.
+
+Libraries and useful functions:
+```{r}
+library(ggplot2)
+library(MASS)
+library(greta)
+library(ggplot2)
+library(reshape2)
+library(ggpubr)
+library(beeswarm)
+source('plotting_functions.R')
+source('useful_functions.R')
+```
+
+
+# 1. Upload the data
+
+Sample annotations
+```{r}
+data <- read.csv("worms_and_what_they_are_extended_2019.csv")
+data$Sample <- as.character(data$Sample)
+data$Genotype.new <- as.character(data$Genotype.new)
+data$Code <- as.character(data$Code)
+CD2Mutant <- sapply(data$Code, function(x) {
+  t <- unlist(strsplit(x,split="[:]"))
+  t[t=="NA"] <- ""
+  if (t[4]!="") # mutagen exposure
+    return(paste(t[3],substr(t[4],1,3),t[5],t[7],sep=":")) # genotype, mutagen, dose, experiment type, generation
+  if (t[4]=="") # mutation accumulation
+    return(paste(t[3],t[7],sep=":")) # genotype, experiment type, generation
+})
+names(CD2Mutant) <- data$Sample
+CD2Mutant <- CD2Mutant[-c(grep("INCORRECT",data$Genotype.check))]
+worms <- names(CD2Mutant)
+worms <- sort(worms)
+CD2Mutant <- CD2Mutant[worms]
+data <- data[match(worms,data$Sample),]
+```
+
+Mutation counts
+
+```{r}
+Y <- read.csv('Spectrum_119_newest.csv', row.names = 1)
+CD2Mutant <- CD2Mutant[intersect(names(CD2Mutant),rownames(Y))]
+Y <- Y[intersect(names(CD2Mutant),rownames(Y)),]
+data <- data[match(names(CD2Mutant), data$Sample),]
+```
+
+# 2. Select samples and prepare the design matrix
+
+```{r}
+genotypes <- unique(sapply(unique(CD2Mutant[c(grep('Rad',CD2Mutant),grep('Xra',CD2Mutant))]), 
+                           function(x) unlist(strsplit(x, split = '[:]'))[1]))
+data.IR <- data[which(data$Mutagen %in% c('Radiation','Xray') | (is.na(data$Mutagen) & data$Genotype.new %in% genotypes)),]
+CD2Mutant.IR <- CD2Mutant[which(data$Mutagen %in% c('Radiation','Xray') | (is.na(data$Mutagen) & data$Genotype.new %in% genotypes))]
+Y.IR <- Y[names(CD2Mutant.IR),1:119]
+```
+
+Prepare some useful numbers
+
+```{r}
+n.IR <- nrow(Y.IR)
+m.IR <- 119
+p.IR <- length(genotypes)
+```
+
+Generation adjustment
+```{r}
+generation.function <- function(N) {
+  if (is.na(N)) return(N)
+  if (N==0) return(0)
+  if (N==1) return(1)
+  alpha = sum(sapply(1:N, function(i) 1/(2^(i-1)))) +
+    0.25*sum(sapply(1:(N-1), function(i) sum(sapply(1:i, function(j) 1/(2^(j-1))))))
+  return(alpha)
+}
+```
+
+Interaction matrix
+
+```{r}
+interactions <- sapply(which(!is.na(data.IR$Mutagen)), function(j) {
+  m <- as.character(data.IR$Mutagen[j])
+  return(paste(data.IR$Genotype.new[j],m,sep=":"))
+})
+names(interactions) <- data.IR$Sample[which(!is.na(data.IR$Mutagen))]
+s.IR <- length(unique(interactions))
+```
+
+Dose
+```{r}
+doses <- data.IR$Drug.concentration
+doses[is.na(doses)] <- 0 # for MA experiments, replace NA dose with 0
+```
+
+Mutagen names
+
+```{r}
+mutagens <- as.character(data.IR$Mutagen)
+mutagens[is.na(mutagens)] <- 'no'
+```
+
+Indicator matrix
+
+```{r}
+X <- data.frame(sapply(unique(data.IR$Genotype.new), function(x) as.numeric(data.IR$Genotype.new == x)),
+                Radiation = as.numeric(mutagens == 'Radiation'),
+                Xray = as.numeric(mutagens == 'Xray'),
+                sapply(unique(interactions), function(x) sapply(rownames(Y.IR), function(z) 
+                  ifelse(is.na(data.IR$Mutagen[match(z,data.IR$Sample)]), 0, as.numeric(interactions[z] == x))))) 
+rownames(X) <- data.IR$Sample
+```
+
+Generation number
+
+```{r}
+g = t(t(sapply(data.IR$Generation,generation.function)))
+g[g[,1] == 0,1] <- 1
+```
+
+Genotype indicators
+
+```{r}
+G <-  X[,1:(p.IR)]
+G1 <- X[,1:(p.IR)]
+```
+
+
+Interactions and mutagens in N2 - indicator matrix for interactions with N2:mutagen
+```{r}
+W2 <- X[,(p.IR+1+1+1):ncol(X)]
+```
+
+Genotype per interaction matrix
+```{r}
+l.IR = p.IR
+zero_exposure_samples <- data.IR$Sample[!is.na(data.IR$Mutagen) & data.IR$Drug.concentration==0]
+for (j in 1:length(zero_exposure_samples)) {
+  colname <- interactions[zero_exposure_samples[j]]
+  colname <- gsub(x = colname, replacement = '.', pattern = '[ ]')
+  colname <- gsub(x = colname, replacement = '.', pattern = '[,]')
+  colname <- gsub(x = colname, replacement = '.', pattern = '[:]')
+  colname <- gsub(x = colname, replacement = '.', pattern = '[-]')
+  colname <- gsub(x = colname, replacement = '.', pattern = '[)]')
+  colname <- gsub(x = colname, replacement = '.', pattern = '[(]')
+  W2[match(zero_exposure_samples[j],data.IR$Sample),colname] <- 1
+}
+```
+
+Interactions only
+
+```{r}
+X <- X[,-grep('N2.',colnames(X),fixed=T)]
+X <- X[,colSums(X)>0]
+W <- X[,(p.IR+1+1):ncol(X)]
+```
+
+Binary mutagen presence matrix
+
+```{r}
+M1 <- X[,p.IR+1,drop=F]
+M1[M1>0] <- 1
+```
+
+Dose adjustment: bring all median doses to 1
+
+```{r}
+Mall <- X[,p.IR+1,drop=F] * doses
+avdose <- NULL
+for (j in 1:ncol(Mall)) {
+  avdose <- c(avdose, mean(Mall[Mall[,j]>0,j]))
+  Mall[,j] = Mall[,j] / mean(Mall[Mall[,j]>0,j])
+}
+names(avdose) <- colnames(Mall)
+# new doses
+doses = t(t(rowSums(Mall)))
+```
+
+Send it all to cluster
+```{r}
+save(X, Mall, avdose, M1, W, W2, s.IR, l.IR, p.IR, n.IR, m.IR, G, G1, g, doses, Y.IR, file = '~/yoda1/IR.RData')
+```
+
+# 3. Run the model in two steps: genotype signatures and mutagen signatures
+
+First step
+
+```{r}
+ma.samples <- data.IR$Sample[is.na(data.IR$Mutagen)]
+ma.X <- X[ma.samples,] * g[match(ma.samples, data.IR$Sample),]
+ma.X <- ma.X[,colSums(ma.X)>0]
+ma.Y <- Y.IR[ma.samples,]
+
+date <- '251119'
+size <- 100
+mode <- 'short'
+
+save(ma.Y, ma.X, ma.samples, file = 'IR_MA_short_data.RData')
+```
+
+Model itself
+
+```{r}
+load('IR_MA_short_data.RData')
+Y <- ma.Y
+short.Y <- cbind(rowSums(Y[,1:16]),rowSums(Y[,17:32]),rowSums(Y[,33:48]),rowSums(Y[,49:64]),rowSums(Y[,65:80]),rowSums(Y[,81:96]),
+                 rowSums(Y[,97:98]),rowSums(Y[,99:104]),rowSums(Y[,105:106]),rowSums(Y[,107:112]),rowSums(Y[,113:119]))
+m <- 11
+sigma_GH <- variable(lower = 0)
+beta_GH = lognormal(meanlog = 0, sdlog = sigma_GH, dim = c(m, ncol(ma.X))) # lognormal with hopefully high variance
+mu_GH = (ma.X %*% t(beta_GH))
+size = 100
+prob = size / (size + mu_GH)
+distribution(short.Y) = negative_binomial(prob = prob, size = size * matrix(1,nrow = nrow(ma.Y), ncol = m))
+ma.model <- model(beta_GH,sigma_GH)
+ma.draws <- mcmc(ma.model, warmup = 5000, n_samples = 1000, chains = 10) # do on cluster
+
+# values
+beta_GH_greta <- matrix(colMeans((do.call('rbind',ma.draws)[,grep('beta_GH',colnames(ma.draws[[1]]))])), nrow = m, ncol = ncol(ma.X))
+beta_GH_greta_low <- matrix(apply((do.call('rbind',ma.draws)[,grep('beta_GH',colnames(ma.draws[[1]]))]),2,quantile,0.025), nrow = m, ncol = ncol(ma.X))
+beta_GH_greta_high <- matrix(apply((do.call('rbind',ma.draws)[,grep('beta_GH',colnames(ma.draws[[1]]))]),2,quantile,0.975), nrow = m, ncol = ncol(ma.X))
+beta_GH_greta_var <- matrix(apply((do.call('rbind',ma.draws)[,grep('beta_GH',colnames(ma.draws[[1]]))]),2,var), nrow = m, ncol = ncol(ma.X))
+colnames(beta_GH_greta) = colnames(beta_GH_greta_low) = colnames(beta_GH_greta_high) =colnames(beta_GH_greta_var) <- colnames(ma.X)
+
+beta.draws <- do.call('rbind',ma.draws)[,grep('beta_GH',colnames(ma.draws[[1]]))]
+shapes <- matrix(sapply(1:ncol(beta.draws), function(i) { print(i); return(fitdistr(beta.draws[,i],'gamma')[[1]][1]) }), nrow = m, ncol = ncol(ma.X))
+rates <- matrix(sapply(1:ncol(beta.draws), function(i) { print(i); return(fitdistr(beta.draws[,i],'gamma')[[1]][2]) }), nrow = m, ncol = ncol(ma.X))
+
+save(beta_GH_greta, beta_GH_greta_low, beta_GH_greta_high, beta_GH_greta_var,
+     shapes, rates, file = 'IR_beta_GH_short.RData')
+```
+
+Step two: model for all
+
+
+```{r}
+date <- '251119'
+size <- 100
+mode <- 'short'
+load('IR_MA_short_data.RData')
+load('IR.RData')
+load('IR_beta_GH_short.RData')
+library(MASS)
+short.Y <- cbind(rowSums(Y.IR[,1:16]),rowSums(Y.IR[,17:32]),rowSums(Y.IR[,33:48]),
+                rowSums(Y.IR[,49:64]),rowSums(Y.IR[,65:80]),rowSums(Y.IR[,81:96]),
+                rowSums(Y.IR[,97:98]),rowSums(Y.IR[,99:104]),rowSums(Y.IR[,105:106]),
+                rowSums(Y.IR[,107:112]),rowSums(Y.IR[,113:119]))
+m.IR <- 11
+
+new_shapes <- matrix(1,nrow = m.IR, ncol = ncol(G1))
+new_rates <- matrix(1,nrow = m.IR, ncol = ncol(G1))
+for (j in 1:ncol(G1)) {
+  if (colnames(G1)[j] %in% colnames(ma.X)) {
+    new_shapes[,j] <- shapes[,match(colnames(G1)[j],colnames(ma.X))]
+    new_rates[,j] <- rates[,match(colnames(G1)[j],colnames(ma.X))]
+  }
+  else {
+    new_shapes[,j] <- shapes[,match('N2',colnames(ma.X))]
+    new_rates[,j] <- rates[,match('N2',colnames(ma.X))]
+  }
+}
+beta_GH <- gamma(shape = new_shapes, rate = new_rates, dim = c(m.IR, p.IR))
+sigma_M <- gamma(shape = 1, rate = 1)
+beta_M = lognormal(meanlog = matrix(0,nrow = m.IR,ncol=1),
+                   sdlog = matrix(1,nrow=m.IR,ncol=1) %*% sigma_M,
+                   dim = c(m.IR,1))
+# generations
+sigma_G = 0.5
+alpha_G = lognormal(meanlog=0, sdlog = sigma_G, dim = c(p.IR,1), truncation = c(0,10))
+r_G = W2 %*% alpha_G
+# genotype aplification by mutagens
+sigma_G_M = 0.5
+alpha_G_M = lognormal(meanlog=0, sdlog = sigma_G_M, dim=c(s.IR,1))
+r_GM = W %*% alpha_G_M
+sigma2_I_2 = gamma(shape = 1, rate = 1, dim = c(1,s.IR))
+beta_I_all = greta::laplace(mu = matrix(0, nrow = m.IR, ncol = s.IR),
+                            sigma = matrix(1,nrow=m.IR,ncol=1) %*% sigma2_I_2)
+# put together the expected value
+mu_GH = as.matrix(G1) %*% t(beta_GH)
+mu_M = M1 %*% t(beta_M)
+mu1 = exp(W %*% t(beta_I_all)) # multiplicative genotype - mutation interaction
+mu =  mu_GH * ((g + r_G + doses*r_GM) %*% matrix(1,nrow=1,ncol=m.IR)) +
+  (mu1 * mu_M) * (doses %*% matrix(1,nrow=1,ncol=m.IR))
+prob = size / (size + mu)
+distribution(short.Y) = negative_binomial(size = size, prob = prob)
+model_full <- model(beta_GH, beta_M, beta_I_all, alpha_G, alpha_G_M, sigma_M, sigma2_I_2)
+draws.step2 <- mcmc(model_full, warmup = 2000, n_samples = 1000, chains = 10)
+draws_all <- do.call('rbind',draws.step2)
+
+pdf(paste0('IR_convergence_',mode,'_size_',size,'_',date,'.pdf'),12,8)
+mcmc_trace(draws.step2[,grep('beta_GH',colnames(draws.step2[[1]]))[sample(1:(p.IR*m.IR),16)]])
+mcmc_trace(draws.step2[,grep('beta_M',colnames(draws.step2[[1]]))])
+mcmc_trace(draws.step2[,grep('beta_I',colnames(draws.step2[[1]]))[sample(1:(s.IR*m.IR),16)]])
+mcmc_trace(draws.step2[,grep('alpha_G',colnames(draws.step2[[1]]))[sample(1:l.IR,16)]])
+mcmc_trace(draws.step2[,grep('alpha_G_M',colnames(draws.step2[[1]]))[sample(1:s.IR,16)]])
+mcmc_trace(draws.step2[,grep('sigma_M',colnames(draws.step2[[1]])),drop=F])
+mcmc_trace(draws.step2[,grep('sigma2_I',colnames(draws.step2[[1]]))[sample(1:s.IR,16)]])
+dev.off()
+
+alpha_G_greta <- colMeans(draws_all[,grep('alpha_G',colnames(draws.step2[[1]]))[1:l.IR]])
+alpha_G_greta_low <- apply(draws_all[,grep('alpha_G',colnames(draws.step2[[1]]))[1:l.IR]],2,quantile,0.025)
+alpha_G_greta_high <- apply(draws_all[,grep('alpha_G',colnames(draws.step2[[1]]))[1:l.IR]],2,quantile,0.975)
+alpha_GM_greta <- colMeans(draws_all[,grep('alpha_G_M',colnames(draws.step2[[1]]))])
+alpha_GM_greta_low <- apply(draws_all[,grep('alpha_G_M',colnames(draws.step2[[1]]))],2,quantile,0.025)
+alpha_GM_greta_high <- apply(draws_all[,grep('alpha_G_M',colnames(draws.step2[[1]]))],2,quantile,0.975)
+alpha_GM_greta_var <- apply(draws_all[,grep('alpha_G_M',colnames(draws.step2[[1]]))],2,var)
+
+beta_GH_greta_full <- matrix(colMeans(draws_all[,grep('beta_G',colnames(draws.step2[[1]]))]), nrow = m.IR, ncol = p.IR)
+beta_GH_greta_full_var <- matrix(apply(draws_all[,grep('beta_G',colnames(draws.step2[[1]]))],2,var), nrow = m.IR, ncol = p.IR)
+beta_GH_greta_full_low <- matrix(apply(draws_all[,grep('beta_G',colnames(draws.step2[[1]]))],2,quantile,0.025), nrow = m.IR, ncol = p.IR)
+beta_GH_greta_full_high <- matrix(apply(draws_all[,grep('beta_G',colnames(draws.step2[[1]]))],2,quantile,0.975), nrow = m.IR, ncol = p.IR)
+colnames(beta_GH_greta_full) = colnames(beta_GH_greta_full_var) = colnames(beta_GH_greta_full_high) = colnames(beta_GH_greta_full_low) = colnames(G1)
+
+beta_M_greta_full <- matrix(colMeans(draws_all[,grep('beta_M',colnames(draws.step2[[1]]))]), nrow = m.IR, ncol = 1)
+beta_M_greta_full_var <- matrix(apply(draws_all[,grep('beta_M',colnames(draws.step2[[1]]))],2,var), nrow = m.IR, ncol = 1)
+beta_M_greta_full_low <- matrix(apply(draws_all[,grep('beta_M',colnames(draws.step2[[1]]))],2,quantile,0.025), nrow = m.IR, ncol = 1)
+beta_M_greta_full_high <- matrix(apply(draws_all[,grep('beta_M',colnames(draws.step2[[1]]))],2,quantile,0.975), nrow = m.IR, ncol = 1)
+colnames(beta_M_greta_full) = colnames(beta_M_greta_full_var) = colnames(beta_M_greta_full_high) = colnames(beta_M_greta_full_low) = colnames(Mall)
+
+beta_I_greta_full <- matrix(colMeans(draws_all[,grep('beta_I',colnames(draws.step2[[1]]))]), nrow = m.IR, ncol = s.IR)
+beta_I_greta_full_var <- matrix(apply(draws_all[,grep('beta_I',colnames(draws.step2[[1]]))],2,var), nrow = m.IR, ncol = s.IR)
+beta_I_greta_full_low <- matrix(apply(draws_all[,grep('beta_I',colnames(draws.step2[[1]]))],2,quantile,0.025), nrow = m.IR, ncol = s.IR)
+beta_I_greta_full_high <- matrix(apply(draws_all[,grep('beta_I',colnames(draws.step2[[1]]))],2,quantile,0.975), nrow = m.IR, ncol = s.IR)
+colnames(beta_I_greta_full) = colnames(beta_I_greta_full_var)=colnames(beta_I_greta_full_low) = colnames(beta_I_greta_full_high) = colnames(W)
+
+save(alpha_G_greta, alpha_G_greta_high, alpha_G_greta_low,
+     beta_GH_greta_full,beta_GH_greta_full_low,beta_GH_greta_full_high,beta_GH_greta_full_var,
+     alpha_GM_greta, alpha_GM_greta_low, alpha_GM_greta_high, alpha_GM_greta_var,
+     beta_M_greta_full, beta_M_greta_full_low, beta_M_greta_full_high, beta_M_greta_full_var,
+     beta_I_greta_full, beta_I_greta_full_low, beta_I_greta_full_high, beta_I_greta_full_var,
+     file = paste0('IR_beta_G_M_I_',mode,'_size_',size,'_',date,'.RData'))
+
+mu <- (as.matrix(G1) %*% t((beta_GH_greta_full))) * ((g + as.matrix(W2) %*% t(t(alpha_G_greta)) +
+                                                        doses * (as.matrix(W) %*% t(t(alpha_GM_greta)))) %*% matrix(1,nrow = 1,ncol=m.IR)) +
+  (as.matrix(M1) %*% t((beta_M_greta_full))) * exp(as.matrix(W) %*% t(beta_I_greta_full)) *
+  (doses %*% matrix(1,nrow = 1,ncol=m.IR))
+
+draws <- draws_all[,c(grep('beta_G',colnames(draws_all)),
+                      grep('beta_M',colnames(draws_all)),
+                      grep('beta_I',colnames(draws_all)),
+                      grep('alpha_G_M',colnames(draws_all)))]
+
+changes <- list()
+changes_subs <- list()
+changes_indels <- list()
+changes_sv <- list()
+#similarities <- list()
+k <- 1
+unit <- 100
+unit_name <- 'Gy'
+cosine <- function(x,y) {
+  return(sum(x * y) / sqrt(sum(x**2)) / sqrt(sum(y**2)))
+}
+for (j in 1:nrow(draws)) {
+  beta_GH_greta_full_tmp <- matrix(as.matrix(draws[j,grep('beta_G',colnames(draws))]), nrow = m.IR, ncol = p.IR)
+  beta_M_greta_full_tmp <- matrix(as.matrix(draws[j,grep('beta_M',colnames(draws))]), nrow = m.IR, ncol = 1)
+  alpha_GM_greta_tmp <- as.matrix(draws[j,grep('alpha_G_M',colnames(draws))])
+  beta_I_greta_full_tmp <- matrix(as.matrix(draws[j,grep('beta_I',colnames(draws))]), nrow = m.IR, ncol = s.IR)
+  changes[[j]] <- rep(NA,ncol(W))
+  names(changes[[j]]) <- colnames(W)
+  changes_subs[[j]] <- rep(NA,ncol(W))
+  names(changes_subs[[j]]) <- colnames(W)
+  changes_indels[[j]] <- rep(NA,ncol(W))
+  names(changes_indels[[j]]) <- colnames(W)
+  changes_sv[[j]] <- rep(NA,ncol(W))
+  names(changes_sv[[j]]) <- colnames(W)
+  #similarities[[j]] <- rep(NA,ncol(W))
+  #names(similarities[[j]]) <- colnames(W)
+  for (z in colnames(W)) {
+    zg = paste(unlist(strsplit(z,split='[.]'))[1:2],collapse='.')
+    if (substr(zg,1,3) == 'bub') {
+      zg <- substr(z,1,14)
+    }
+    if (substr(zg,1,7) == 'rad.54B') {
+      zg <- substr(z,1,16)
+    }
+    zm <- 'Radiation'
+    mu_0 <- beta_GH_greta_full_tmp[,match(zg,colnames(beta_GH_greta_full))] +
+      beta_M_greta_full_tmp[,1] / avdose * unit
+    mu_1 <- beta_GH_greta_full_tmp[,match(zg,colnames(beta_GH_greta_full))] *
+      (1 + alpha_GM_greta_tmp[match(z,colnames(W)),] / avdose * unit) +
+      beta_M_greta_full_tmp[,1] *
+      exp(beta_I_greta_full_tmp[,match(z,colnames(beta_I_greta_full))]) / avdose * unit
+    changes_subs[[j]][z] <- (sum(mu_1[1:6]) / sum(mu_0[1:6]))
+    changes_indels[[j]][z] <- (sum(mu_1[8:10]) / sum(mu_0[8:10]))
+    changes_sv[[j]][z] <- (mu_1[11] / mu_0[11])
+    changes[[j]][z] <- (sum(mu_1) / sum(mu_0))
+    # similarities[[j]][z] <- cosine(mu_0, mu_1)
+  }
+  print(j)
+}
+changes -> changes_all
+save(changes_all, changes_subs, changes_indels, changes_sv,
+     file = paste0('IR_plotting_',mode,'_size_',size,'_',date,'.RData'))
+
+
+pdf(paste0('IR_quality_',mode,'_size_',size,'_',date,'.pdf'),10,10)
+plot(rowSums(short.Y), rowSums(mu),pch = 16)
+abline(a=0,b=1,col='red')
+dev.off()
+```
+
+# 4. Interpret the results
+
+Upload
+```{r}
+load(paste0('IR_plotting_short_size_',size,'_',date,'.RData'))
+```
+
+Plot foldchanges
+```{r}
+pdf('IR_logfold_plots.pdf',5,10)
+interesting_interactions <- NULL
+par(mar = c(6,4,2,2), mfrow = c(3,1))
+X_axis <- c(1:s.IR)
+
+for (i in 1:3) {
+  if (i == 1)   changes <- do.call('cbind',changes_subs)
+  if (i == 2)   changes <- do.call('cbind',changes_indels)
+  if (i == 3)   changes <- do.call('cbind',changes_sv)
+  sds <- apply(changes,1,sd)
+  low <- apply(changes,1,quantile,0.025)
+  high <- apply(changes,1,quantile,0.975)
+  means <- apply(changes,1,mean)
+  
+  o <- order(means);
+  means <- means[o]; low <- low[o]; high <- high[o]
+  
+  sapply(names(means), function(x) {
+    zscore = log(means[x]) / (sds[x] / means[x])
+    return(1 - pchisq(q = zscore**2, df = 1))
+  }) -> pv
+  pv <- p.adjust(pv,method='BH')
+  interesting_interactions <- unique(c(interesting_interactions, names(means)[pv<0.05]))
+  
+  if (i == 1) { 
+    upper_lim <- 10
+    main <- 'Foldchange in substitutions'
+  }
+  if ( i == 2) {
+    upper_lim <- 10
+    main <- 'Foldchange in indels'
+  }
+  if (i == 3) {
+    upper_lim <- 20#50
+    main <- 'Foldchange in SVs'
+  }
+  
+  par(mar = c(10,4,4,4))
+  plot(x = X_axis, xaxt = 'n', y = rep(NA,length(X_axis)), ylim = c(log10(0.1),log10(upper_lim)), 
+       yaxt = 'n', xlab = '', ylab = '', bty='n', main = main)
+  for (j in 1:length(X_axis)) {
+    cur.col <- 'gray88'; cur.lwd = 1
+    if (pv[j] < 0.05) {
+      cur.col <- 'gray48'
+      cur.lwd <- 2
+    }
+    polygon(x = c(X_axis[j] - 0.5,rep(X_axis[j] + 0.5,2),rep(X_axis[j] - 0.5,2)),
+            y = c(rep(log10(high[j]),2),rep(log10(low[j]),2),log10(high[j])),
+            col = cur.col,
+            border = 0.01)
+    lines(x = c(X_axis[j] - 0.5, X_axis[j] + 0.5), y = rep(log10(means[j]),2), lwd = cur.lwd)
+  }
+  abline(h = log10(1), lty = 2)
+  
+  axis(side = 2, labels = c(0.1,0.5,1,2,5,c(1:(upper_lim/10))*10), at = log10(c(0.1,0.5,1,2,5,c(1:(upper_lim/10))*10)),las = 2)
+  axis(side = 1, 
+       labels = names(means),
+       at = X_axis,
+       las=2, cex.axis = 0.5)
+  
+}
+
+dev.off()
+```
+
+Compare signatures to the wild-type exposure signature
+```{r}
+load(paste0('IR_beta_G_M_I_long_size_', size, '_', date, '.RData'))
+comparisons <- matrix(NA, nrow = nrow(beta_I_greta_full), ncol = ncol(beta_I_greta_full), dimnames = list(colnames(Y.IR)[1:119], colnames(beta_I_greta_full)))
+for (z in colnames(beta_I_greta_full)) {
+  stat_mu = (exp(beta_I_greta_full[,z]) - 1)*beta_M_greta_full[,'Radiation']
+  stat_sd = sqrt(exp(beta_I_greta_full[,z])**2 * (beta_M_greta_full_var[,'Radiation'] + beta_M_greta_full[,'Radiation']**2 * beta_I_greta_full_var[,z]) +
+                   beta_M_greta_full_var[,'Radiation'])
+  zscores = stat_mu / stat_sd
+  comparisons[,z] <- 1 - pchisq(q = zscores**2, df = 1)
+}
+comparisons <- matrix(p.adjust(comparisons,method='BH'), 
+                      nrow = nrow(beta_I_greta_full), 
+                      ncol = ncol(beta_I_greta_full), 
+                      dimnames = list(colnames(Y.IR)[1:119], colnames(beta_I_greta_full)))
+unique(colnames(comparisons)[which(comparisons<0.05,arr.ind = T)[,2]])
+# "xpa.1.Radiation" - DNV
+unique(colnames(comparisons)[which(comparisons<0.1,arr.ind = T)[,2]])
+# "xpa.1.Radiation" - DNV
+
+load(paste0('IR_beta_G_M_I_short_size_', size, '_', date, '.RData'))
+comparisons.hl <- matrix(NA, nrow = 11, ncol = ncol(beta_I_greta_full), dimnames = list(c(c("C>A","C>G","C>T","T>A","T>C","T>G"), 'MNV', 'Deletions',
+                                                                                          'Complex\n indels','Insertions', 'Structural\n Variants'), 
+                                                                                        colnames(beta_I_greta_full)))
+for (z in colnames(beta_I_greta_full)) {
+  stat_mu = (exp(beta_I_greta_full[,z]) - 1)*beta_M_greta_full[,'Radiation']
+  stat_sd = sqrt(exp(beta_I_greta_full[,z])**2 * (beta_M_greta_full_var[,'Radiation'] + beta_M_greta_full[,'Radiation']**2 * beta_I_greta_full_var[,z]) +
+                   beta_M_greta_full_var[,'Radiation'])
+  zscores = stat_mu / stat_sd
+  comparisons.hl[,z] <- 1 - pchisq(q = zscores**2, df = 1)
+}
+comparisons.hl <- matrix(p.adjust(comparisons.hl,method='BH'), 
+                         nrow = nrow(beta_I_greta_full), 
+                         ncol = ncol(beta_I_greta_full), 
+                         dimnames = list(rownames(comparisons.hl), colnames(beta_I_greta_full)))
+unique(colnames(comparisons.hl)[which(comparisons.hl<0.05,arr.ind = T)[,2]])
+# "agt.1.Radiation"        "rcq.5.Radiation"        "slx.1.Radiation"        "him.6.Radiation"        "polh.1.Radiation"       "xpa.1.Radiation"       
+# "xpf.1.Radiation"        "mus.81.cep.1.Radiation"
+unique(colnames(comparisons.hl)[which(comparisons.hl<0.1,arr.ind = T)[,2]])
+# "agt.1.Radiation" (C>T)  "rcq.5.Radiation" (T>A,T>C)  "slx.1.Radiation" (Dels)  "him.6.Radiation" (C>A, C>G, T>C)        
+# "polh.1.Radiation" (T>C)  "xpa.1.Radiation" (C>A, C>T, MNV, Dels)
+# "xpf.1.Radiation" (C>A, T>A, Dels)  "mus.81.cep.1.Radiation" (all subs, MNV, Dels, DI)
+
+first_points <- c(rep('A*A',6), '2 bp', '1 bp (in repeats)', '1-49 bp', '1 bp (in repeats)', "Tandem dup.")
+last_points <- c(rep('T*T',6), 'over 2 bp', "over 50 bp",'50-400 bp',"over 50 bp","Foldbacks")
+colors = c("#2EBAED","#000000","#DE1C14","#D4D2D2","#ADCC54","#F0D0CE",
+           "brown","#8DD3C7","#FFFFB3","#BEBADA","darkmagenta")
+names(first_points) = names(last_points) = names(colors) <- c(c("C>A","C>G","C>T","T>A","T>C","T>G"), 'MNV', 'Deletions',
+                                                              'Complex\n indels','Insertions', 'Structural\n Variants')
+thr <- 0.1
+dsbr <- c('N2.Radiation',"agt.1.Radiation","xpa.1.Radiation","xpf.1.Radiation",
+          "csb.1.Radiation", "xpc.1.Radiation","tdp.1.Radiation",
+          "ung.1.Radiation","polh.1.Radiation","rev.1.Radiation","dog.1.Radiation",
+          "brc.1.Radiation","brd.1.Radiation","mrt.2.Radiation",
+          "slx.1.Radiation","rfs.1.Radiation","rip.1.Radiation",
+          "rcq.5.Radiation","him.6.Radiation","wrn.1.Radiation",
+          "brc.1.lig.4.Radiation","mus.81.cep.1.Radiation")
+pretty.names <- c('N2',"agt-1","xpa-1","xpf-1","csb-1","xpc-1","tdp-1","ung-1",
+                  "polh-1","rev-1","dog-1","brc-1","brd-1","mrt-2","slx-1",'rfs-1',
+                  'rip-1',"rcq-5",'him-6','wrn-1',"brc-1\n lig-4", "mus-81\n cep-1")
+df_lines <- data.frame(
+  substitution = rownames(which(comparisons.hl[,dsbr[-1]]<thr, arr.ind = T)),
+  variable = pretty.names[-1][which(comparisons.hl[,dsbr[-1]]<thr, arr.ind = T)[,2]],
+  x = first_points[rownames(which(comparisons.hl[,dsbr[-1]]<thr, arr.ind = T))], 
+  y = -0.01, 
+  xend =last_points[rownames(which(comparisons.hl[,dsbr[-1]]<thr, arr.ind = T))], 
+  yend = -0.01,
+  width = 1,
+  color = colors[rownames(which(comparisons.hl[,dsbr[-1]]<thr, arr.ind = T))])
+
+to.show <- cbind(beta_M_greta_full[,'Radiation'],
+                 beta_M_greta_full[,'Radiation']*exp(beta_I_greta_full[,dsbr[-1],drop=F])); 
+colnames(to.show) <- pretty.names
+to.show.low <- cbind(beta_M_greta_full_low[,'Radiation'],
+                     to.show[,-1] - 2 * sqrt(exp(beta_I_greta_full[,dsbr[-1],drop=F])**2 * 
+                                               (beta_M_greta_full_var[,'Radiation'] + 
+                                                  beta_M_greta_full[,'Radiation']**2 * beta_I_greta_full_var[,dsbr[-1],drop=F]))); 
+colnames(to.show.low) <- pretty.names
+to.show.high <- cbind(beta_M_greta_full_high[,'Radiation'],
+                      to.show[,-1] + 2 * sqrt(exp(beta_I_greta_full[,dsbr[-1],drop=F])**2 * 
+                                                (beta_M_greta_full_var[,'Radiation'] + 
+                                                   beta_M_greta_full[,'Radiation']**2 * beta_I_greta_full_var[,dsbr[-1],drop=F]))); 
+colnames(to.show.high) <- pretty.names
+to.show.sign <- cbind(rep(0,119),comparisons[,dsbr[-1],drop=F]); colnames(to.show.sign) <- pretty.names
+
+df_stars <- data.frame(substitution = 'C>A', variable = c('ung-1','xpa-1','xpf-1',"dog-1","brc-1\n lig-4"), x = "C*T",
+                       y = 3, width = 1, value = max(to.show.high)/2)
+
+to.show.low[to.show.low<0] <- 0
+
+pdf('IR_signatures_significance.pdf', 10, 14)
+plot_fullsig_wb(to.show, CI = T,
+                low = to.show.low, ymax = 5,
+                high = to.show.high, norm = F,
+                colors = colors, ytitle = 'Number of mutations per generation',
+                significance = to.show.sign,
+                thr=thr, err.bar.size = 0.1) +
+  #diff_scale = T, diff_limits = c(1,6,4,1,2,1,1,5,1,2,1,1,1,1,1,1,1)) +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(size=10), strip.text.x = element_text(size=12), 
+        axis.text.x = element_text(size = 8), axis.title.y = element_text(size = 12)) + 
+  geom_segment(data = df_lines, aes(x=x,y=y,yend=yend,xend=xend), col = df_lines$color, size = 1) +
+  geom_text(data = df_stars, aes(x = x, y = y), label = "***", size=6)
+dev.off()
+```
+
+# 5. Clustering analysis
+
+```{r}
+
+allclust <- read.table('~/IR_cluster_info.tsv', sep='\t', header = T)
+
+number_per_cluster <- list()
+cluster_sizes <- list()
+for (gene in unique(allclust$genotype)) {
+  
+  distances <- diff(allclust$start[allclust$genotype == gene])
+  rle(as.numeric(abs(distances) < 100)) -> dist_rle
+  number_per_cluster[[gene]] <- dist_rle$lengths[dist_rle$values == 1] + 1
+  cluster_sizes[[gene]] <- NULL
+  cur_clust <- 0
+  for (j in 1:length(distances)) {
+    if (abs(distances[j]) < 100)
+      cur_clust <- cur_clust + distances[j]
+    else {
+      if (cur_clust > 0)
+        cluster_sizes[[gene]] <- c(cluster_sizes[[gene]], cur_clust)
+      cur_clust <- 0
+    }
+  }
+  if (length(distances) == 1 & cur_clust > 0) cluster_sizes[[gene]] <- c(cluster_sizes[[gene]], cur_clust)
+  
+}
+
+number_per_cluster$`rad-54B` <- 0
+number_per_cluster$`ndx-4` <- 0
+number_per_cluster$`him-6` <- 0
+names(number_per_cluster)[43] <- 'rad-54.B (gt3308)'
+names(number_per_cluster)[52] <- 'rad-54.B (gk340656)'
+names(number_per_cluster)[44] <- 'bub-3 (gt2000)'
+names(number_per_cluster)[45] <- 'bub-3 (ok3437)'
+names(number_per_cluster)[23] <- 'tdpo-1'
+
+#correct_order <- c(1,5:7,13,53,31:32,23:24,
+#                   36,11,37:38,14,26,35,
+#                   34,33,19,3,8,30,22,42,
+#                   43,52,20,21,2,15,12,28,
+#                   54,18,25,44:46,9:10)
+# for main figure
+correct_order <- c(1,6,53,32,24,29,
+                   36,11,37:38,14,26,35,
+                   34,33,19,3,8,30,22,42,
+                   43,52,20,21,51,2,15,12,28,
+                   54,40,25,44:46,9:10)
+
+cluster_sizes$`rad-54B` <- 0
+cluster_sizes$`ndx-4` <- 0
+cluster_sizes$`him-6` <- 0
+names(cluster_sizes)[43] <- 'rad-54.B (gt3308)'
+names(cluster_sizes)[52] <- 'rad-54.B (gk340656)'
+names(cluster_sizes)[44] <- 'bub-3 (gt2000)'
+names(cluster_sizes)[45] <- 'bub-3 (ok3437)'
+names(cluster_sizes)[23] <- 'tdpo-1'
+
+library(beeswarm)
+pdf('Mutations_per_cluster_across_genotypes.pdf',10,6)
+par(mar = c(10,4,4,2))
+beeswarm(number_per_cluster[correct_order], las = 2, bty = 'n', method = 'hex', ylab = 'Number of mutations / cluster',
+         ylim = c(0,10), cex = 0.5, pch = 16, corral = 'gutter', main = 'Sizes of IR-induced clusters across genotypes (muts)',
+         xaxt = 'n')
+axis(side = 1, at = c(1:length(correct_order)), labels = names(number_per_cluster)[correct_order], 
+     font = 3, las = 2, lty = 0)
+dev.off()
+pdf('Cluster_span_across_genotypes.pdf',10,6)
+par(mar = c(10,4,4,2))
+boxplot(cluster_sizes[correct_order], las = 2, frame = F, xaxt = 'n',
+        main = 'Sizes of IR-induced clusters across genotypes (bps)',
+        ylim = c(0,200), ylab = 'bp spanned by cluster', pch = 16, 
+        cex = 0.5, outline = F)
+axis(side = 1, at = c(1:length(correct_order)), labels = names(cluster_sizes)[correct_order], 
+     font = 3, las = 2, lty = 0)
+beeswarm(cluster_sizes[correct_order], las = 2, bty = 'n', method = 'hex', 
+         ylab = 'bp spanned by cluster', col = 'gray56', add = T, 
+         ylim = c(0,200), cex = 0.5, pch = 16, corral = 'gutter', 
+         main = 'Sizes of IR-induced clusters across genotypes (bps)')
+dev.off()
+
+```
+
+
+# 6. Signature comparison to humans
+
+Pick up mutations for Behjati et al 2016 paper on secondary malignancies after radiotherapy.
+Substitutions:
+```{r}
+library(openxlsx)
+library('BSgenome.Hsapiens.UCSC.hg19')
+tmp <- openxlsx::read.xlsx('~/Downloads/ncomms12605-s2.xlsx', sheet = 1, startRow = 2)
+types.full <- paste(rep(rep(c('A','C','G','T'), each = 4), 6), '[',
+                      rep(c('C','T'), each = 48), '>', rep(c('A','G','T','A','C','G'), each=16), ']',
+                      rep(c('A','C','G','T'), 24), sep='')
+muts <- lapply(unique(tmp$Tumour), function(x) {
+  tmp1 <- tmp[tmp$Tumour==x,]
+  colnames(tmp1) <- c('Sample','Chrom','Pos','Ref','Alt','Gene','Transcript','Codon','Protein','Consequence')
+  print(nrow(tmp1))
+  return(getTrinucleotideSubs_human_table(tmp1))
+})
+muts <- sapply(muts, function(x) tncToPyrimidine(as.character(x)))
+donor.mut.mat <- matrix(0,nrow = length(muts), ncol = 96, dimnames = list(unique(tmp$Tumour), types.full))
+for (i in 1:nrow(donor.mut.mat)) {
+  a <- table(muts[[i]])
+  donor.mut.mat[i,names(a)] <- a
+}
+```
+Indels:
+```{r}
+tmp <- openxlsx::read.xlsx('~/Downloads/ncomms12605-s3.xlsx', sheet = 1, startRow = 2)
+INDELS = c(
+  '1 bp (in repeats)', '1 bp (non-rep.)', '2-5 bp (in repeats)','2-5 bp (non-rep.)',
+  "6-50 bp","over 50 bp",
+  '1-49 bp','50-400 bp',
+  '1 bp (in repeats)', '1 bp (non-rep.)', '2-5 bp (in repeats)','2-5 bp (non-rep.)',
+  '6-50 bp','over 50 bp')
+donor.indel.mut.mat <- matrix(0,nrow = length(unique(tmp$Tumour)), 
+                              ncol = 14, dimnames = list(unique(tmp$Tumour), 
+                                                         INDELS))
+for (z in rownames(donor.indel.mut.mat)) {
+  
+  tmp1 <- tmp[tmp$Tumour == z,]
+  lens1 <- nchar(tmp1$Wildtype.sequence)
+  lens2 <- nchar(tmp1$Mutant.sequence)
+  donor.indel.mut.mat[z,2] <- sum(tmp1$Indel.type == 'Del' & lens1 < 3)
+  donor.indel.mut.mat[z,4] <- sum(tmp1$Indel.type == 'Del' & lens1 < 7 & lens1 > 2)
+  donor.indel.mut.mat[z,5] <- sum(tmp1$Indel.type == 'Del' & lens1 < 52 & lens1 > 6 )
+  donor.indel.mut.mat[z,6] <- sum(tmp1$Indel.type == 'Del' & lens1 > 51)
+  donor.indel.mut.mat[z,7] <- sum(tmp1$Indel.type == 'Complex' & max(lens1,lens2) < 52)
+  donor.indel.mut.mat[z,8] <- sum(tmp1$Indel.type == 'Complex' & max(lens1,lens2) > 51)
+  donor.indel.mut.mat[z,10] <- sum(tmp1$Indel.type == 'Ins' & lens2 < 3)
+  donor.indel.mut.mat[z,12] <- sum(tmp1$Indel.type == 'Ins' & lens2 < 7 & lens2 > 2)
+  donor.indel.mut.mat[z,13] <- sum(tmp1$Indel.type == 'Ins' & lens2 < 52 & lens2 > 6 )
+  donor.indel.mut.mat[z,14] <- sum(tmp1$Indel.type == 'Ins' & lens2 > 51)
+  
+}
+par(mfrow = c(2,1))
+f <- barplot(colMeans(donor.indel.mut.mat[,-c(1,3,9,11)]), 
+        names.arg = c('1bp del', '2-5bp del','6-50bp del', '>50bp del','<50bp in-del','>50bp in-del',
+                      '1bp ins', '2-5bp ins','6-50bp ins', '>50bp ins'), las = 2, cex.names = 0.7,
+        col = c(rep("#8DD3C7", 4),rep("#FFFFB3",2),rep("#BEBADA",4)), 
+        main = 'Average indels in irradiation-associated secondary malignancies \n (with CIs covering +- 2SEM)', 
+        ylim = c(0,250))
+arrows(y0 = colMeans(donor.indel.mut.mat[,-c(1,3,9,11)]) - 2 * apply(donor.indel.mut.mat[,-c(1,3,9,11)],2,sd)/nrow(donor.indel.mut.mat),
+       y1 = colMeans(donor.indel.mut.mat[,-c(1,3,9,11)]) + 2* apply(donor.indel.mut.mat[,-c(1,3,9,11)],2,sd)/nrow(donor.indel.mut.mat),
+       x0 = f[,1], x1 = f[,1], col = 'gray56', angle = 90, length=0.05, code = 3)
+f <- barplot(c(sum(beta_M_greta_full[99:100,'Radiation']),
+          sum(beta_M_greta_full[101:102,'Radiation']),
+          beta_M_greta_full[103:106,'Radiation'],
+          sum(beta_M_greta_full[107:108,'Radiation']),
+          sum(beta_M_greta_full[109:110,'Radiation']),
+          beta_M_greta_full[111:112,'Radiation']) / sum(beta_M_greta_full[99:112,'Radiation']), 
+        names.arg = c('1bp del', '2-5bp del','6-50bp del', '>50bp del','<50bp in-del','>50bp in-del',
+                      '1bp ins', '2-5bp ins','6-50bp ins', '>50bp ins'), las = 2, cex.names = 0.7,
+        col = c(rep("#8DD3C7", 4),rep("#FFFFB3",2),rep("#BEBADA",4)), ylim = c(0,0.4),
+        main = 'Indel signature of ionizing radiation in C. elegans\n (with 95% credible intervals)')
+arrows(y0 = c(sum(beta_M_greta_full_low[99:100,'Radiation']),
+          sum(beta_M_greta_full_low[101:102,'Radiation']),
+          beta_M_greta_full_low[103:106,'Radiation'],
+          sum(beta_M_greta_full_low[107:108,'Radiation']),
+          sum(beta_M_greta_full_low[109:110,'Radiation']),
+          beta_M_greta_full_low[111:112,'Radiation'])/sum(beta_M_greta_full[99:112,'Radiation']),
+       y1 = c(sum(beta_M_greta_full_high[99:100,'Radiation']),
+          sum(beta_M_greta_full_high[101:102,'Radiation']),
+          beta_M_greta_full_high[103:106,'Radiation'],
+          sum(beta_M_greta_full_high[107:108,'Radiation']),
+          sum(beta_M_greta_full_high[109:110,'Radiation']),
+          beta_M_greta_full_high[111:112,'Radiation'])/sum(beta_M_greta_full[99:112,'Radiation']),
+       x0 = f[,1], x1 = f[,1], col = 'gray56', angle = 90, length=0.05, code = 3)
+```
+
+Rearrangements:
+```{r}
+tmp <- openxlsx::read.xlsx('~/Downloads/ncomms12605-s4.xlsx', sheet = 1, startRow = 2)
+SVS = c("Tandem dup.","Deletions","Inversions","Complex events","Translocations","Interchr. events","Foldbacks")
+donor.sv.mut.mat <- matrix(0,nrow = length(unique(tmp$Tumour)), 
+                              ncol = 5, dimnames = list(unique(tmp$Tumour), 
+                                                         unique(tmp$Rearrangement.type)))
+tmp$Rearrangement.type <- factor(tmp$Rearrangement.type)
+for (z in rownames(donor.sv.mut.mat)) {
+  
+  tmp1 <- tmp[tmp$Tumour == z,]
+  donor.sv.mut.mat[z,] <- table(tmp1$Rearrangement.type)
+  
+}
+
+par(mfrow = c(2,1))
+f <- barplot(colMeans(donor.sv.mut.mat), 
+        las=2, cex.names = 0.5, ylim = c(0,40),
+        col = "darkmagenta",
+        main = 'Average rearrangements in irradiation-associated secondary malignancies\n (with CIs covering +- 2SEM, n = 12)')
+arrows(y0 = colMeans(donor.sv.mut.mat) - 2 * 
+         apply(donor.sv.mut.mat,2,sd)/nrow(donor.sv.mut.mat),
+       y1 = colMeans(donor.sv.mut.mat) + 2* 
+         apply(donor.sv.mut.mat,2,sd)/nrow(donor.sv.mut.mat),
+       x0 = f[,1], x1 = f[,1], col = 'gray56', angle = 90, length=0.05, code = 3)
+f <- barplot(beta_M_greta_full[113:119,'Radiation']/sum(beta_M_greta_full[113:119,'Radiation']), 
+        las=2, names.arg = SVS, cex.names = 0.6, ylim = c(0,0.5),
+        col = "darkmagenta", main = 'SV signature of ionizing radiation in C. elegans\n (with 95% credible intervals)')
+arrows(y0 = beta_M_greta_full_low[113:119,'Radiation']/sum(beta_M_greta_full[113:119,'Radiation']),
+       y1 = beta_M_greta_full_high[113:119,'Radiation']/sum(beta_M_greta_full[113:119,'Radiation']),
+       x0 = f[,1], x1 = f[,1], col = 'gray56', angle = 90, length=0.05, code = 3)
+```
+Clustering analysis for human data:
+
+```{r}
+isMNV <- function(mut_table) {
+  d <- diff(mut_table$Position) == 1
+  w <- c(FALSE, d) | c(d, FALSE)
+  return(w)
+}
+isClustered <- function(mut_table, p=0.01, q=0.1, r=100){
+  
+  mut_table$Chr[mut_table$Chr == 'X'] <- 23
+  mut_table$Chr[mut_table$Chr == 'Y'] <- 24
+  
+  d <- diff(mut_table$Position)
+  w <- d > 1 & diff(as.numeric(mut_table$Chr)) == 0
+  #	p <- 1e-3 # P N>Kat
+  #	q <- 0.05 # P Kat>N
+  P <- matrix(c(1-p,p,q, 1-q), ncol=2, byrow=TRUE) # Transition probabilities matrix
+  p0 <- c(1,0)
+  s <- c(mean(d[w]), r)
+  dw <- d[w]
+  l <- length(dw)
+  T1 <- T2 <- matrix(0,ncol=l, nrow=2)
+  T1[,1] <- log(c(q/(q+p), p/(q+p))) # log of Vitterbi path probabilities
+  lP <- log(P)
+  dg <- rbind(dgeom(dw, prob=1/s[1], log=TRUE), dgeom(dw, prob=1/s[2], log=TRUE)) 
+  # state observation loglikelihood given the current state (none, kataegis)
+  
+  # Viterbi algorithm
+  
+  for(i in 2:l){
+    x <- ((T1[,i-1] + lP) + dg[,i])
+    T2[1,i] <- (x[1,1] < x[2,1])+1
+    T2[2,i] <- (x[1,2] < x[2,2])+1
+    T1[1,i] <- x[T2[1,i],1]
+    T1[2,i] <- x[T2[2,i],2]
+    #x <- T1[,i-1] + lP + rep(dg[,i],each=2) # previous Vitterbi path probability * transition probability * observation likelihood
+    #T1[,i] <- sapply(1:2, function(state) max(x[,state]))
+    #T2[,i] <- sapply(1:2,function(state) which.max(x[,state])) # most probable states - backpointer
+  }
+  finalT1 <- max(T1[,l] + log(c(q/(q+p), p/(q+p)))) # + probability of transition to final state, let's say 1 and then log(1)=0
+  finalT2 <- which.max(T1[,l] + log(c(q/(q+p), p/(q+p))))# + 
+  z <- numeric(l)
+  z[l] <- finalT2
+  z[l] <- 1 # this means that the backtrace starts from 1 (not necessarily)
+  for(i in l:2){
+    z[i-1] <- T2[z[i],i]
+  }
+  k <- numeric(nrow(mut_table))
+  k[-1][w][-1] <- z[-l]-1
+  k[-nrow(mut_table)][w][-1] <- (z[-l]-1) | k[-nrow(mut_table)][w][-1]
+  
+  # Other clustered
+  pc <- pgeom(dw, prob=1/s[1], lower.tail=TRUE)
+  qc <- p.adjust(pc, "BH") < 0.05
+  
+  cl <- numeric(nrow(mut_table))
+  cl[-1][w] <- qc
+  cl[-nrow(mut_table)][w] <- qc | cl[-nrow(mut_table)][w]
+  
+  clk <- factor(pmin(cl + 2*k,2), levels=0:2, labels=c("None","Clustered","Kataegis"))
+  return(clk)
+}
+```
+
+Pull together supplementary data with substitutions and indels from Behjati et al. 2016.
+```{r}
+subs <- openxlsx::read.xlsx('~/Downloads/ncomms12605-s2.xlsx', sheet = 1, startRow = 2)
+indels <- openxlsx::read.xlsx('~/Downloads/ncomms12605-s3.xlsx', sheet = 1, startRow = 2)
+patients <- unique(subs$Tumour)
+tot_list_IR <- list()
+for (pat in patients) {
+
+  tmp_subs <- subs[subs$Tumour == pat,]
+  tmp_subs$Class <- 'Substitution'
+  tmp_subs$Type <- paste0(tmp_subs$Wildtype.base,'>',tmp_subs$Mutant.base)
+  tmp_inds <- indels[indels$Tumour == pat,-10]
+  tmp_inds$Class <- 'Indel'
+  tmp_inds$Type <- indels$Indel.type[indels$Tumour == pat]
+  tmp_svs <- svs[svs$Tumour == pat,]
+
+  dnvs <- isMNV(tmp_subs)
+  tmp_dnvs <- tmp_subs[dnvs,]
+  tmp_dnvs$Class <- 'DNV'
+  tmp_dnvs$Wildtype.base[seq(1,sum(dnvs),2)] <- paste0(tmp_dnvs$Wildtype.base[seq(1,sum(dnvs),2)], tmp_dnvs$Wildtype.base[seq(2,sum(dnvs),2)])
+  tmp_dnvs$Mutant.base[seq(1,sum(dnvs),2)] <- paste0(tmp_dnvs$Mutant.base[seq(1,sum(dnvs),2)], tmp_dnvs$Mutant.base[seq(2,sum(dnvs),2)])
+  tmp_dnvs <- tmp_dnvs[seq(1,sum(dnvs),2),]
+  tmp_dnvs$Type <- paste0(tmp_dnvs$Wildtype.base,'>',tmp_dnvs$Mutant.base)
+  
+  tmp_subs <- tmp_subs[!dnvs,]
+  tmp_subs$Type[tmp_subs$Type == 'A>C'] <- 'T>G'
+  tmp_subs$Type[tmp_subs$Type == 'A>G'] <- 'T>C'
+  tmp_subs$Type[tmp_subs$Type == 'A>T'] <- 'T>A'
+  tmp_subs$Type[tmp_subs$Type == 'G>A'] <- 'C>T'
+  tmp_subs$Type[tmp_subs$Type == 'G>C'] <- 'C>G'
+  tmp_subs$Type[tmp_subs$Type == 'G>T'] <- 'C>A'
+
+  colnames(tmp_subs)[4:5] <- c('Wildtype','Mutant')
+  colnames(tmp_dnvs)[4:5] <- c('Wildtype','Mutant')
+  colnames(tmp_inds)[4:5] <- c('Wildtype','Mutant')
+  total <- rbind(tmp_subs, tmp_dnvs, tmp_inds)
+  total <- total[order(total$Chr),]
+  for (ch in unique(total$Chr)) {
+    total[total$Chr == ch,] <- total[total$Chr == ch,][order(total$Position[total$Chr == ch]),]
+  }
+  
+  k <- isClustered(total)
+  total$Clustered <- as.character(k)
+
+  tot_list_IR[[pat]] <- total
+}
+new_order <- c(2, 6, 7, 4, 11, 12, 1, 3, 5, 8:10)
+f <- barplot(sapply(tot_list_IR[new_order], function(x) sum(x$Clustered != 'None') / nrow(x)), 
+             las = 2, main = 'Proportion of clustered mutations across human samples',
+             ylim = c(0,0.1), yaxt = 'n')
+axis(side = 2, at = seq(0,0.1,0.02), labels = paste0(seq(0,10,2),'%'), las = 2)
+props <- sapply(tot_list_IR[new_order], function(x) sum(x$Clustered != 'None') / nrow(x))
+arrows(x0 = f, y0 = props - 1.95 * sqrt(p*(1-p)/sapply(tot_list_IR[new_order], nrow)),
+       y1 = props + 1.95 * sqrt(p*(1-p)/sapply(tot_list_IR[new_order], nrow)),
+       col = 'black', length = 0)
+```
+
+```{r}
+boxplot(sapply(tot_list_IR, function(x) sum(x$Clustered != 'None') / nrow(x)), 
+        las = 2, frame = F, xaxt = 'n',
+        main = 'Proportion of clustered mutations across human samples',
+        ylim = c(0,0.1), ylab = '', pch = 16, 
+        cex = 0.5, outline = F)
+beeswarm(sapply(tot_list_IR, function(x) sum(x$Clustered != 'None') / nrow(x)), las = 2, 
+         bty = 'n', method = 'hex', 
+         col = 'gray56', add = T, 
+         ylim = c(0,0.1), cex = 0.5, pch = 16, corral = 'gutter')
+```
+
+```{r}
+barplot(sapply(tot_list_IR[new_order], function(x) sum(diff(as.numeric(factor(x$Clustered)))!=0)/2), las = 2, main='Numbers of clusters per sample')
+```
+Numbers of mutations per cluster and size distributions
+```{r}
+number_per_cluster <- list()
+cluster_sizes <- list()
+for (pat in names(tot_list_IR)) {
+  
+  distances <- diff(tot_list_IR[[pat]]$Position)
+  rle(as.numeric(abs(distances) < 100)) -> dist_rle
+  number_per_cluster[[pat]] <- dist_rle$lengths[dist_rle$values == 1] + 1
+  cluster_sizes[[pat]] <- NULL
+  cur_clust <- 0
+  for (j in 1:length(distances)) {
+    if (abs(distances[j]) < 100)
+      cur_clust <- cur_clust + distances[j]
+    else {
+      if (cur_clust > 0)
+        cluster_sizes[[pat]] <- c(cluster_sizes[[pat]], cur_clust)
+      cur_clust <- 0
+    }
+  }
+  if (length(distances) == 1 & cur_clust > 0) cluster_sizes[[pat]] <- c(cluster_sizes[[pat]], cur_clust)
+  
+}
+beeswarm(number_per_cluster[new_order], las = 2, bty = 'n', method = 'hex', ylab = 'mutations / cluster',
+         ylim = c(0,12), cex = 0.5, pch = 16, corral = 'gutter', main = 'Sizes of IR-induced clusters across samples',
+         xaxt = 'n')
+axis(side = 1, at = c(1:12), labels = names(tot_list_IR)[new_order], 
+     las = 2, lty = 0)
+```
+
+
+```{r}
+boxplot(cluster_sizes[new_order], las = 2, frame = F, xaxt = 'n',
+        main = 'Genomic sizes of IR-induced clusters across samples',
+        ylim = c(0,400), ylab = 'bp spanned by cluster', pch = 16, 
+        cex = 0.5, outline = F)
+axis(side = 1, at = c(1:12), labels = names(tot_list_IR)[new_order], 
+     las = 2, lty = 0)
+beeswarm(cluster_sizes[new_order], las = 2, bty = 'n', method = 'hex', 
+         col = 'gray56', add = T, cex = 0.5, pch = 16, corral = 'gutter')
+```
+
+Non-IR human data: download from ICGC data portal the data for WGS analysed BRCA-UK and BOCA-UK to "ICGC-BRCA-SARC-BOCA" folder:
+
+```{r}
+clin <- read.delim('~/Downloads/ICGC-BRCA-SARC-BOCA/donor.tsv', sep = '\t', stringsAsFactors = F)
+spec <- read.delim('~/Downloads/ICGC-BRCA-SARC-BOCA/specimen.tsv', sep = '\t', stringsAsFactors = F)
+muts <- read.delim('~/Downloads/ICGC-BRCA-SARC-BOCA/simple_somatic_mutation.open.tsv', sep= '\t', stringsAsFactors = F)
+patients <- unique(as.character(muts$icgc_donor_id[muts$icgc_donor_id %in% c('BRCA-UK','BOCA-UK')]))
+muts <- muts[muts$icgc_specimen_id %in% unique(spec$icgc_specimen_id[spec$specimen_type == 'Primary tumour - solid tissue']),]
+patients <- patients[which(sapply(patients, function(x) length(unique(muts$icgc_mutation_id[muts$icgc_donor_id == x]))) < 10000)]
+tot_list <- list()
+for (pat in patients) {
+
+  tmp_subs <- muts[muts$icgc_donor_id == pat & grepl('base',muts$mutation_type),]
+  tmp_subs <- tmp_subs[!duplicated(tmp_subs$icgc_mutation_id),]
+  tmp_subs$Class <- 'Substitution'
+  tmp_subs$Type <- paste0(tmp_subs$mutated_from_allele,'>',tmp_subs$mutated_to_allele)
+  colnames(tmp_subs)[c(9,10)] <- c('Chr','Position')
+  tmp_subs <- tmp_subs[order(tmp_subs$Chr),]
+  for (ch in unique(tmp_subs$Chr)) {
+    tmp_subs[tmp_subs$Chr == ch,] <- tmp_subs[tmp_subs$Chr == ch,][order(tmp_subs$Position[tmp_subs$Chr == ch]),]
+  }
+  
+  tmp_inds <- muts[muts$icgc_donor_id == pat & !grepl('base',muts$mutation_type),]
+  if (nrow(tmp_inds)>0) {
+    tmp_inds <- tmp_inds[!duplicated(tmp_inds$icgc_mutation_id),]
+    tmp_inds$Class <- 'Indel'
+    tmp_inds$Type <- NA
+    tmp_inds$Type[grepl('del', tmp_inds$mutation_type)] <- 'D'
+    tmp_inds$Type[grepl('ind', tmp_inds$mutation_type)] <- 'I'
+    colnames(tmp_inds)[c(9,10)] <- c('Chr','Position')
+  }
+
+  dnvs <- isMNV(tmp_subs)
+  tmp_dnvs <- tmp_subs[dnvs,,drop = F]
+  if (sum(dnvs)>0) {
+    tmp_dnvs$Class <- 'DNV'
+    tmp_dnvs$Wildtype.base[seq(1,sum(dnvs),2)] <- paste0(tmp_dnvs$Wildtype.base[seq(1,sum(dnvs),2)], tmp_dnvs$Wildtype.base[seq(2,sum(dnvs),2)])
+    tmp_dnvs$Mutant.base[seq(1,sum(dnvs),2)] <- paste0(tmp_dnvs$Mutant.base[seq(1,sum(dnvs),2)], tmp_dnvs$Mutant.base[seq(2,sum(dnvs),2)])
+    tmp_dnvs <- tmp_dnvs[seq(1,sum(dnvs),2),]
+    tmp_dnvs$Type <- paste0(tmp_dnvs$Wildtype.base,'>',tmp_dnvs$Mutant.base)
+  }
+  
+  tmp_subs <- tmp_subs[!dnvs,]
+  tmp_subs$Type[tmp_subs$Type == 'A>C'] <- 'T>G'
+  tmp_subs$Type[tmp_subs$Type == 'A>G'] <- 'T>C'
+  tmp_subs$Type[tmp_subs$Type == 'A>T'] <- 'T>A'
+  tmp_subs$Type[tmp_subs$Type == 'G>A'] <- 'C>T'
+  tmp_subs$Type[tmp_subs$Type == 'G>C'] <- 'C>G'
+  tmp_subs$Type[tmp_subs$Type == 'G>T'] <- 'C>A'
+
+  colnames(tmp_subs)[16:17] <- c('Wildtype','Mutant')
+  colnames(tmp_dnvs)[16:17] <- c('Wildtype','Mutant')
+  colnames(tmp_inds)[16:17] <- c('Wildtype','Mutant')
+  total <- rbind(tmp_subs, tmp_dnvs, tmp_inds)
+  total <- total[order(total$Chr),]
+  for (ch in unique(total$Chr)) {
+    total[total$Chr == ch,] <- total[total$Chr == ch,][order(total$Position[total$Chr == ch]),]
+  }
+  
+  k <- isClustered(total)
+  total$Clustered <- as.character(k)
+
+  tot_list[[pat]] <- total
+}
+```
+
+```{r}
+f <- boxplot(list(BRCA = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BRCA-UK'], function(x) 
+                          sum(x$Clustered != 'None') / nrow(x)),
+                  IR_breast = sapply(tot_list_IR[8:10], function(x) sum(x$Clustered != 'None') / nrow(x)),
+                  Bone = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BOCA-UK'], function(x) 
+                          sum(x$Clustered != 'None') / nrow(x)),
+                  IR_bone = sapply(tot_list_IR[-c(8:10)], function(x) sum(x$Clustered != 'None') / nrow(x))),
+             las = 2, main = 'Proportion of clustered mutations across human cancers', frame = F)
+beeswarm(list(BRCA = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BRCA-UK'], function(x) 
+                          sum(x$Clustered != 'None') / nrow(x)),
+                  IR_breast = sapply(tot_list_IR[8:10], function(x) sum(x$Clustered != 'None') / nrow(x)),
+                  Bone = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BOCA-UK'], function(x) 
+                          sum(x$Clustered != 'None') / nrow(x)),
+                  IR_bone = sapply(tot_list_IR[-c(8:10)], function(x) sum(x$Clustered != 'None') / nrow(x))), 
+         pch = 16, col='gray86', add = T)
+
+```
+
+```{r}
+f <- boxplot(list(BRCA = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BRCA-UK'], function(x) 
+                          sum(diff(as.numeric(factor(x$Clustered)))!=0)/nrow(x)/2),
+                  IR_breast = sapply(tot_list_IR[8:10], function(x) sum(diff(as.numeric(factor(x$Clustered)))!=0)/2/nrow(x)),
+                  Bone = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BOCA-UK'], function(x) 
+                          sum(diff(as.numeric(factor(x$Clustered)))!=0)/nrow(x)/2),
+                  IR_bone = sapply(tot_list_IR[-c(8:10)], function(x) sum(diff(as.numeric(factor(x$Clustered)))!=0)/2/nrow(x))),
+             las = 2, main = 'Number of clusters relative to total burden across human cancers', frame = F)
+beeswarm(list(BRCA = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BRCA-UK'], function(x) 
+                          sum(diff(as.numeric(factor(x$Clustered)))!=0)/nrow(x)/2),
+                  IR_breast = sapply(tot_list_IR[8:10], function(x) sum(diff(as.numeric(factor(x$Clustered)))!=0)/2/nrow(x)),
+                  Bone = sapply(tot_list[clin$project_code[match(names(tot_list), clin$icgc_donor_id)] == 'BOCA-UK'], function(x) 
+                          sum(diff(as.numeric(factor(x$Clustered)))!=0)/nrow(x)/2),
+                  IR_bone = sapply(tot_list_IR[-c(8:10)], function(x) sum(diff(as.numeric(factor(x$Clustered)))!=0)/2/nrow(x))), 
+         pch = 16, col='gray86', add = T)
+```
+
+Humanize worms:
+```{r}
+library(deconstructSigs)
+genome <- 'BSgenome.Celegans.UCSC.ce11'
+genome.seq <- getSeq(get(genome))[-7]
+worm.trinucleotides <- colSums(trinucleotideFrequency(genome.seq))
+human.trinucleotides <- as.vector(t(tri.counts.genome)) # / sum(tri.counts.genome))) # counts from "deconstructSigs" package
+names(human.trinucleotides) <- row.names(tri.counts.genome)
+types <- paste(rep(rep(c('A','C','G','T'), each = 4), 6), rep(c('C','T'), each = 48),
+                      rep(c('A','C','G','T'), 24), sep='')
+trinucleotide.freq.factor <- sapply(unique(types), function(x) {
+  freq.worm <- worm.trinucleotides[x] + worm.trinucleotides[as.character(reverseComplement(DNAString(x)))]
+  return(freq.worm /  human.trinucleotides[x]) # tri.counts.genome is already classified w.r.t. pyrimidine reference
+})
+names(trinucleotide.freq.factor) <- unique(types)
+
+worm.hum <- beta_M_greta_full[1:96,'Radiation']
+worm.hum <- worm.hum / trinucleotide.freq.factor[types]
+
+similarity <- data.frame(substitution = 'T>C',
+                         variable = c('human','Sig3','Sig40'),
+                         x = 'G*A', y = 0.025, width = 1, value = 0.1,
+                         label = c(round(cosine(worm.hum, colMeans(donor.mut.mat)),2),
+                                   round(cosine(worm.hum, sbs_cancer_signatures[,'SBS3']),2),
+                                   round(cosine(worm.hum, sbs_cancer_signatures[,'SBS40']),2)))
+
+plot1 <- plot_sig_wb(data.frame(worm = worm.hum, human = colMeans(donor.mut.mat), 
+                       Sig3 = sbs_cancer_signatures[,'SBS3'],
+                       Sig40 = sbs_cancer_signatures[,'SBS40'])) +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(size=10), strip.text.x = element_text(size=12), 
+        axis.text.x = element_text(size = 8), axis.title.y = element_text(size = 12)) + 
+  geom_text(data = similarity, aes(x = x, y = y), label = similarity$label, size=6)
+```
+
+## 6.2 DNV comparison
+
+Humanisation
+```{r}
+dnv.types <- substr(dnv.types.full,1,2)
+worm.dinucleotides <- colSums(dinucleotideFrequency(genome.seq))
+human.genome.seq <- getSeq(get(human_genome))[1:23]
+human.dinucleotides <- colSums(dinucleotideFrequency(human.genome.seq))
+dinucleotide.freq.factor <- sapply(unique(dnv.types), function(x) {
+  freq.worm <- worm.dinucleotides[x] + worm.dinucleotides[as.character(reverseComplement(DNAString(x)))]
+  freq.human <- human.dinucleotides[x] + human.dinucleotides[as.character(reverseComplement(DNAString(x)))]
+  return(freq.worm / freq.human) # tri.counts.genome is already classified w.r.t. pyrimidine reference
+})
+names(dinucleotide.freq.factor) <- unique(dnv.types)
+```
+
+
+UV across genotypes
+```{r}
+dnv.spectrum1 <- dnv.spectrum[rowSums(dnv.spectrum)>0,]
+to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:UV',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('N2:UV',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                   dinucleotide.freq.factor[dnv.types],
+                 pole4 = rowMeans(t(dnv.spectrum1[grep('pole-4:UV',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('pole-4:UV',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                   dinucleotide.freq.factor[dnv.types],
+                 xpc1 = rowMeans(t(dnv.spectrum1[grep('xpc-1:UV',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('xpc-1:UV',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                   dinucleotide.freq.factor[dnv.types],
+                 xpf1 = rowMeans(t(dnv.spectrum1[grep('xpf-1:UV',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('xpf-1:UV',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                   dinucleotide.freq.factor[dnv.types],
+                 DBS1 = dbs_cancer_signatures[,'DBS1'])
+p <- plot_dnv_only(to.show)
+```
+IR across genotypes
+```{r}
+to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('N2:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                                      dinucleotide.freq.factor[dnv.types],
+                 brc = rowMeans(t(dnv.spectrum1[grep('brc-1:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('brc-1:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                                      dinucleotide.freq.factor[dnv.types],
+                 xpa = rowMeans(t(dnv.spectrum1[grep('xpa-1:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('xpa-1:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                                      dinucleotide.freq.factor[dnv.types],
+                 xpf = rowMeans(t(dnv.spectrum1[grep('xpf-1:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('xpf-1:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                                      dinucleotide.freq.factor[dnv.types],
+                 DBS2 = dbs_cancer_signatures[,'DBS2'],
+                 DBS4 = dbs_cancer_signatures[,'DBS4'],
+                 DBS11 = dbs_cancer_signatures[,'DBS11'])
+p <- plot_dnv_only(to.show)
+```
+Cisplatin
+```{r}
+to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('N2:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                                                         dinucleotide.freq.factor[dnv.types],
+                 fcd = rowMeans(t(dnv.spectrum1[grep('fcd-2:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('fcd-2:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])) /
+                                                         dinucleotide.freq.factor[dnv.types],
+                 xpc = rowMeans(t(dnv.spectrum1[grep('xpc-1:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('xpc-1:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])) / 
+                                                         dinucleotide.freq.factor[dnv.types],
+                 xpf = rowMeans(t(dnv.spectrum1[grep('xpf-1:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])/
+                                          rowSums(dnv.spectrum1[grep('xpf-1:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])) / 
+                                                         dinucleotide.freq.factor[dnv.types],
+                 DBS5 = dbs_cancer_signatures[,'DBS5'])
+p <- plot_dnv_only(to.show)
+```
+
+```{r}
+to.show <- cbind(Radiation = colMeans(dnv.spectrum1[grep('N2:Rad',CD2Mutant[rownames(dnv.spectrum1)]),]),
+                 `UV-B` = colMeans(dnv.spectrum1[grep('N2:UV',CD2Mutant[rownames(dnv.spectrum1)]),]),
+                 Cisplatin = colMeans(dnv.spectrum1[grep('N2:Cis',CD2Mutant[rownames(dnv.spectrum1)]),]))
+p <- plot_dnv_only(to.show)
+```
+
+
+```{r}
+dnv.types <- substr(dnv.types.full,1,2)
+worm.dinucleotides <- colSums(dinucleotideFrequency(genome.seq))
+human.genome.seq <- getSeq(get(human_genome))[1:23]
+human.dinucleotides <- colSums(dinucleotideFrequency(human.genome.seq))
+dinucleotide.freq.factor <- sapply(unique(dnv.types), function(x) {
+  freq.worm <- worm.dinucleotides[x] + worm.dinucleotides[as.character(reverseComplement(DNAString(x)))]
+  freq.human <- human.dinucleotides[x] + human.dinucleotides[as.character(reverseComplement(DNAString(x)))]
+  return(freq.worm / freq.human) # tri.counts.genome is already classified w.r.t. pyrimidine reference
+})
+names(dinucleotide.freq.factor) <- unique(dnv.types)
+
+plot_dnv_only(dbs_cancer_signatures)
+```
+
+# Session information
+
+
+```{r}
+# Session information
+# (was run on an LSF for a speed up, hence different versions)
+
+# R version 3.5.1 (2018-07-02)
+# Matrix products: default
+
+# attached base packages:
+# [1] stats4    parallel  stats     graphics  grDevices utils     datasets
+# [8] methods   base
+
+# other attached packages:
+# [1] reshape2_1.4.3              ggplot2_3.1.0
+# [3] VariantAnnotation_1.28.13   Rsamtools_1.34.1
+# [5] Biostrings_2.50.2           XVector_0.22.0
+# [7] SummarizedExperiment_1.12.0 DelayedArray_0.8.0
+# [9] BiocParallel_1.16.6         matrixStats_0.54.0
+# [11] Biobase_2.42.0              GenomicRanges_1.34.0
+# [13] GenomeInfoDb_1.18.2         IRanges_2.16.0
+# [15] S4Vectors_0.20.1            BiocGenerics_0.28.0
+# [17] MASS_7.3-50                 bayesplot_1.7.0
+# [19] greta_0.3.0.9002            beeswarm_0.2.3
+# [21] BSgenome.Hsapiens.UCSC.hg19_1.4.0 BSgenome_1.52.0
+# [23] openxlsx_4.1.0.1
+
+# loaded via a namespace (and not attached):
+# [1] httr_1.4.0               bit64_0.9-7              jsonlite_1.6
+# [4] assertthat_0.2.1         blob_1.1.1               BSgenome_1.50.0
+# [7] GenomeInfoDbData_1.2.0   progress_1.2.0           globals_0.12.4
+# [10] pillar_1.3.1             RSQLite_2.1.1            lattice_0.20-35
+# [13] glue_1.3.1               reticulate_1.11.1        digest_0.6.18
+# [16] colorspace_1.4-1         Matrix_1.2-14            plyr_1.8.4
+# [19] XML_3.98-1.19            pkgconfig_2.0.2          biomaRt_2.38.0
+# [22] listenv_0.7.0            zlibbioc_1.28.0          purrr_0.3.2
+# [25] scales_1.0.0             whisker_0.3-2            tibble_2.1.1
+# [28] withr_2.1.2              GenomicFeatures_1.34.8   lazyeval_0.2.2
+# [31] magrittr_1.5             crayon_1.3.4             memoise_1.1.0
+# [34] future_1.12.0            tools_3.5.1              prettyunits_1.0.2
+# [37] hms_0.4.2                stringr_1.4.0            munsell_0.5.0
+# [40] AnnotationDbi_1.44.0     compiler_3.5.1           rlang_0.3.3
+# [43] grid_3.5.1               RCurl_1.95-4.12          ggridges_0.5.1
+# [46] bitops_1.0-6             base64enc_0.1-3          gtable_0.3.0
+# [49] codetools_0.2-15         DBI_1.0.0                R6_2.4.0
+# [52] GenomicAlignments_1.18.1 tfruns_1.4               dplyr_0.8.0.1
+# [55] tensorflow_1.10          rtracklayer_1.42.2       bit_1.1-14
+# [58] stringi_1.4.3            Rcpp_1.0.1               tidyselect_0.2.5
+# [61] coda_0.19-2
+```
+
