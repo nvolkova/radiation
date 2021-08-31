@@ -11,4 +11,8 @@ B. Meier, N.V. Volkova, et al. "C. elegans genome-wide analysis reveals DNA repa
 
 `useful_functions.R` contains additional functions used for analysis or data upload.
 
-`data` folder contains instructions for data upload and processing.
+Instructions for data upload:
+
+- Download Supplementary Table 1, Sheet 2 (Sample_description) as sample_description.csv
+- Download Supplementary Table 1, Sheet 4 (Mutations_IR_samples) as mutations_ir_samples.csv
+- Download the archive with VCFs (Supplementary Data 6) from https://www.nature.com/articles/s41467-020-15912-7#Sec24 and extract into a 'Filtered_VCFS_recovered' folder
