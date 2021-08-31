@@ -23,20 +23,14 @@ source('useful_functions.R')
 
 Sample annotations
 ```{r}
-data <- read.csv("worms_and_what_they_are_extended_2019.csv")
-data$Sample <- as.character(data$Sample)
-data$Genotype.new <- as.character(data$Genotype.new)
-data$Code <- as.character(data$Code)
-CD2Mutant <- sapply(data$Code, function(x) {
-  t <- unlist(strsplit(x,split="[:]"))
-  t[t=="NA"] <- ""
-  if (t[4]!="") # mutagen exposure
-    return(paste(t[3],substr(t[4],1,3),t[5],t[7],sep=":")) # genotype, mutagen, dose, experiment type, generation
-  if (t[4]=="") # mutation accumulation
-    return(paste(t[3],t[7],sep=":")) # genotype, experiment type, generation
-})
+data <- read.csv("sample_description.csv", stringsAsFactors=F)
+CD2Mutant <- sapply(1:nrow(data), function(i) ifelse(is.na(data$Mutagen[i]),
+    paste(data$Genotype[i],
+          substr(data$Mutagen[i],1,3),
+          data$Drug.concentration[i],
+          data$Generation[i],sep=":"),
+    paste(data$Genotype[i], data$Generation[i], sep = ":"))
 names(CD2Mutant) <- data$Sample
-CD2Mutant <- CD2Mutant[-c(grep("INCORRECT",data$Genotype.check))]
 worms <- names(CD2Mutant)
 worms <- sort(worms)
 CD2Mutant <- CD2Mutant[worms]
@@ -46,10 +40,15 @@ data <- data[match(worms,data$Sample),]
 Mutation counts
 
 ```{r}
-Y <- read.csv('Spectrum_119_newest.csv', row.names = 1)
-CD2Mutant <- CD2Mutant[intersect(names(CD2Mutant),rownames(Y))]
-Y <- Y[intersect(names(CD2Mutant),rownames(Y)),]
-data <- data[match(names(CD2Mutant), data$Sample),]
+Y.IR <- read.csv('mutations_ir_samples.csv', row.names = 1)
+data.IR <- data[rownames(Y.IR),]
+```
+
+Total gamma-radiation induced mutation counts across samples in different genotypes:
+```{r}
+data.IR$total_muts <- rowSums(Y.IR)
+df <- data.IR[data.IR$Mutagen == 'Radiation',]
+ggplot(data = df, aes(x = Sample, y = total_muts, fill = Genotype)) + geom_bar(stat = 'identity') + facet_grid(Sample ~ Genotype) + guides(fill = F)
 ```
 
 # 2. Select samples and prepare the design matrix
@@ -57,9 +56,8 @@ data <- data[match(names(CD2Mutant), data$Sample),]
 ```{r}
 genotypes <- unique(sapply(unique(CD2Mutant[c(grep('Rad',CD2Mutant),grep('Xra',CD2Mutant))]), 
                            function(x) unlist(strsplit(x, split = '[:]'))[1]))
-data.IR <- data[which(data$Mutagen %in% c('Radiation','Xray') | (is.na(data$Mutagen) & data$Genotype.new %in% genotypes)),]
-CD2Mutant.IR <- CD2Mutant[which(data$Mutagen %in% c('Radiation','Xray') | (is.na(data$Mutagen) & data$Genotype.new %in% genotypes))]
-Y.IR <- Y[names(CD2Mutant.IR),1:119]
+data.IR <- data[which(data$Mutagen %in% c('Radiation','Xray') | (is.na(data$Mutagen) & data$Genotype %in% genotypes)),]
+CD2Mutant.IR <- CD2Mutant[which(data$Mutagen %in% c('Radiation','Xray') | (is.na(data$Mutagen) & data$Genotype %in% genotypes))]
 ```
 
 Prepare some useful numbers
@@ -87,7 +85,7 @@ Interaction matrix
 ```{r}
 interactions <- sapply(which(!is.na(data.IR$Mutagen)), function(j) {
   m <- as.character(data.IR$Mutagen[j])
-  return(paste(data.IR$Genotype.new[j],m,sep=":"))
+  return(paste(data.IR$Genotype[j],m,sep=":"))
 })
 names(interactions) <- data.IR$Sample[which(!is.na(data.IR$Mutagen))]
 s.IR <- length(unique(interactions))
@@ -109,7 +107,7 @@ mutagens[is.na(mutagens)] <- 'no'
 Indicator matrix
 
 ```{r}
-X <- data.frame(sapply(unique(data.IR$Genotype.new), function(x) as.numeric(data.IR$Genotype.new == x)),
+X <- data.frame(sapply(unique(data.IR$Genotype), function(x) as.numeric(data.IR$Genotype == x)),
                 Radiation = as.numeric(mutagens == 'Radiation'),
                 Xray = as.numeric(mutagens == 'Xray'),
                 sapply(unique(interactions), function(x) sapply(rownames(Y.IR), function(z) 
@@ -481,6 +479,7 @@ dev.off()
 ```
 
 Compare signatures to the wild-type exposure signature
+
 ```{r}
 load(paste0('IR_beta_G_M_I_long_size_', size, '_', date, '.RData'))
 comparisons <- matrix(NA, nrow = nrow(beta_I_greta_full), ncol = ncol(beta_I_greta_full), dimnames = list(colnames(Y.IR)[1:119], colnames(beta_I_greta_full)))
@@ -589,7 +588,7 @@ dev.off()
 
 ```{r}
 
-allclust <- read.table('~/IR_cluster_info.tsv', sep='\t', header = T)
+allclust <- read.csv('clustered_mutations.csv')
 
 number_per_cluster <- list()
 cluster_sizes <- list()
@@ -613,6 +612,7 @@ for (gene in unique(allclust$genotype)) {
   
 }
 
+# assign correct names for plotting
 number_per_cluster$`rad-54B` <- 0
 number_per_cluster$`ndx-4` <- 0
 number_per_cluster$`him-6` <- 0
@@ -672,6 +672,7 @@ dev.off()
 # 6. Signature comparison to humans
 
 Pick up mutations for Behjati et al 2016 paper on secondary malignancies after radiotherapy.
+
 Substitutions:
 ```{r}
 library(openxlsx)
@@ -789,6 +790,7 @@ arrows(y0 = beta_M_greta_full_low[113:119,'Radiation']/sum(beta_M_greta_full[113
        y1 = beta_M_greta_full_high[113:119,'Radiation']/sum(beta_M_greta_full[113:119,'Radiation']),
        x0 = f[,1], x1 = f[,1], col = 'gray56', angle = 90, length=0.05, code = 3)
 ```
+
 Clustering analysis for human data:
 
 ```{r}
@@ -926,7 +928,9 @@ beeswarm(sapply(tot_list_IR, function(x) sum(x$Clustered != 'None') / nrow(x)), 
 ```{r}
 barplot(sapply(tot_list_IR[new_order], function(x) sum(diff(as.numeric(factor(x$Clustered)))!=0)/2), las = 2, main='Numbers of clusters per sample')
 ```
+
 Numbers of mutations per cluster and size distributions
+
 ```{r}
 number_per_cluster <- list()
 cluster_sizes <- list()
@@ -1106,6 +1110,7 @@ plot1 <- plot_sig_wb(data.frame(worm = worm.hum, human = colMeans(donor.mut.mat)
 ## 6.2 DNV comparison
 
 Humanisation
+
 ```{r}
 dnv.types <- substr(dnv.types.full,1,2)
 worm.dinucleotides <- colSums(dinucleotideFrequency(genome.seq))
@@ -1121,6 +1126,7 @@ names(dinucleotide.freq.factor) <- unique(dnv.types)
 
 
 UV across genotypes
+
 ```{r}
 dnv.spectrum1 <- dnv.spectrum[rowSums(dnv.spectrum)>0,]
 to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:UV',CD2Mutant[rownames(dnv.spectrum1)]),])/
@@ -1138,7 +1144,9 @@ to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:UV',CD2Mutant[rownames(d
                  DBS1 = dbs_cancer_signatures[,'DBS1'])
 p <- plot_dnv_only(to.show)
 ```
+
 IR across genotypes
+
 ```{r}
 to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])/
                                           rowSums(dnv.spectrum1[grep('N2:Rad',CD2Mutant[rownames(dnv.spectrum1)]),])) /
@@ -1157,7 +1165,9 @@ to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:Rad',CD2Mutant[rownames(
                  DBS11 = dbs_cancer_signatures[,'DBS11'])
 p <- plot_dnv_only(to.show)
 ```
+
 Cisplatin
+
 ```{r}
 to.show <- cbind(N2 = rowMeans(t(dnv.spectrum1[grep('N2:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])/
                                           rowSums(dnv.spectrum1[grep('N2:Cis',CD2Mutant[rownames(dnv.spectrum1)]),])) /
