@@ -4,18 +4,14 @@ source('plotting_functions.R')
 
 data <- read.csv("sample_annotations.csv")
 data$Sample <- as.character(data$Sample)
-data$Genotype.new <- as.character(data$Genotype.new)
-data$Code <- as.character(data$Code)
-CD2Mutant <- sapply(data$Code, function(x) {
-  t <- unlist(strsplit(x,split="[:]"))
-  t[t=="NA"] <- ""
-  if (t[4]!="") # mutagen exposure
-    return(paste(t[3],substr(t[4],1,3),t[5],t[7],sep=":")) # genotype, mutagen, dose, experiment type, generation
-  if (t[4]=="") # mutation accumulation
-    return(paste(t[3],t[7],sep=":")) # genotype, experiment type, generation
-})
+data$Genotype <- as.character(data$Genotype)
+CD2Mutant <- sapply(1:nrow(data), function(i) ifelse(is.na(data$Mutagen[i]),
+    paste(data$Genotype[i],
+          substr(data$Mutagen[i],1,3),
+          data$Drug.concentration[i],
+          data$Generation[i],sep=":"),
+    paste(data$Genotype[i], data$Generation[i], sep = ":")))
 names(CD2Mutant) <- data$Sample
-CD2Mutant <- CD2Mutant[-c(grep("INCORRECT",data$Genotype.check))]
 worms <- names(CD2Mutant)
 worms <- sort(worms)
 CD2Mutant <- CD2Mutant[worms]
@@ -25,12 +21,12 @@ mut.acc <- names(CD2Mutant)[is.na(data$Mutagen)]
 normal_panel = names(CD2Mutant)[grep("N2:1",CD2Mutant[1:1000])][1:6]
 mut.acc <- setdiff(mut.acc, normal_panel)
 
+# Upload substitutions
+vcfs_dedup <- sapply(worms, function(x) readVcf(paste0('Filtered_VCFS_recovered/SNV/',x,'_filtered_substitutions.vcf')))
 # Upload indels
-indels_dedup <- sapply(worms, function(x) readVcf(paste0('PATH/TO/INDEL/VCFS/',x,'vcf.gz')))
-# Upload subs
-indels_dedup <- sapply(worms, function(x) readVcf(paste0('PATH/TO/SUBS/VCFS/',x,'vcf.gz')))
+indels_dedup <- sapply(worms, function(x) readVcf(paste0('Filtered_VCFS_recovered/IND/',x,'.filtered.indels.vcf')))
 # Upload SVs
-SVclust.new <- sapply(worms, function(x) readVcf(paste0('PATH/TO/SV/TABLES/',x,'.tsv')))
+SVclust.new <- sapply(worms, function(x) as.data.frame(granges(readVcf(paste0('Filtered_VCFS_recovered/SV/',x,'_filt.vcf')))))
 
 svmat <- do.call('rbind',SVclust.new)
 svmat <- svmat[as.character(svmat$CHR1) == as.character(svmat$CHR2),]
@@ -156,7 +152,6 @@ for (ex in experiments) {
       
     tmp_vcf <- vcfs_dedup[[n]]
     if (length(tmp_vcf) > 0) {
-      #mcols(tmp_vcf)$Sample <- n
       tmp <- isMNV(tmp_vcf)
       tmp_vcf_df <- as.data.frame(granges(tmp_vcf))
       tmp_vcf_df$Sample <- n
@@ -356,7 +351,7 @@ names(cluster_sizes)[45] <- 'bub-3 (ok3437)'
 names(cluster_sizes)[23] <- 'tdpo-1'
 
 library(beeswarm)
-pdf('~/Desktop/Irradiation analysis/Mutations_per_cluster_across_genotypes.pdf',10,6)
+pdf('Mutations_per_cluster_across_genotypes.pdf',10,6)
 par(mar = c(10,4,4,2))
 beeswarm(number_per_cluster[correct_order], las = 2, bty = 'n', method = 'hex', ylab = 'Number of mutations / cluster',
          ylim = c(0,10), cex = 0.5, pch = 16, corral = 'gutter', main = 'Sizes of IR-induced clusters across genotypes (muts)',
@@ -398,159 +393,8 @@ clust_summary$number_clust_muts <- sapply(clust_summary$name, function(x) sum(al
 clust_summary$total_samples_of_this_code <- sapply(clust_summary$code, function(x) sum(CD2Mutant.reduced == x))
 clust_summary$total_mutations_in_sample <- sapply(clust_summary$name, function(x) sum(Y[x,1:112]))
 
-write.csv(clust_summary, file = '~/Desktop/Irradiation analysis/Clusters_in_irradiated_samples_new.csv')
+
 #################### now some stats ##########################
-
-load('~/yoda2/IR/IR_adj.RData')
-
-#experiments <- unique(CD2Mutant[which(data$Mutagen == 'Radiation' & data$Drug.concentration>0 & data$Type == 'mutagen')])
-
-clust <- sapply(rownames(Y.IR)[which(data.IR$Mutagen == 'Radiation' & data.IR$Drug.concentration>0 )], 
-                function(x) {
-                  if (x %in% clust_summary$name) 
-                    return(clust_summary$number_of_clusters[clust_summary$name == x])
-                  else 
-                    return(0)
-          })
-mean(clust[grep('exo-1:Rad:0',CD2Mutant[names(clust)])])
-mean(clust[grep('exo-1:Rad:10',CD2Mutant[names(clust)])])
-mean(clust[grep('exo-1:Rad:20',CD2Mutant[names(clust)])])
-mean(clust[grep('N2:Rad:40',CD2Mutant[names(clust)])])
-mean(clust[grep('N2:Rad:80',CD2Mutant[names(clust)])])
-
-CD2Mutant.very.reduced <- sapply(CD2Mutant[names(clust)], function(x) {
-  tmp <- unlist(strsplit(x, split = '[:]'))
-  #if (length(tmp) == 2 | tmp[1] == 'N2') return('non')
-  #else 
-  return(paste(tmp[1:2],collapse=':'))
-})
-
-doses <- data.IR$Drug.concentration[match(names(clust), data.IR$Sample)]
-interactions <- t(sapply(names(clust), function(x) as.numeric(unique(CD2Mutant.very.reduced) == CD2Mutant.very.reduced[match(x,names(CD2Mutant.very.reduced))])))
-colnames(interactions) <- unique(CD2Mutant.very.reduced)
-
-cd <- data.frame(interactions * doses)
-
-cd <- cd[,-match(c('exo.1.Rad','exo.3.Rad','apn.1.Rad',
-                   'parp.1.Rad','pole.4.Rad','rcq.5.Rad',
-                   'ndx.4.Rad','agt.1.Rad','tdp.1.Rad'), colnames(cd))]
-
-cd1 <- cd
-cd1[cd1>0] <- 1
-
-simplemodel <- glm( clust ~ offset(log(doses)) + 0 + .,data = cd1, family = stats::poisson())
-coef(summary(simplemodel))
-which(p.adjust(coef(summary(simplemodel))[,4], method = 'BH')<0.05) # everything
-
-coeffs <- coef(summary(simplemodel))
-
-pvclust <- NULL
-for (zzz in rownames(coeffs)[-1]) {
-  stat_mu = coeffs[zzz,1] - coeffs['N2.Rad',1]
-  stat_sd = sqrt(coeffs[zzz,2]**2 + coeffs['N2.Rad',2]**2)
-  zscore = stat_mu / stat_sd
-  pvclust <- c(pvclust, 1 - pchisq(q = zscore**2, df = 1))
-}
-rownames(coeffs)[-1][which(p.adjust(pvclust,method='BH') < 0.05)]
-
-rates <- exp(coeffs[,1])
-rates.sd <- rates * coeffs[,2]
-
-# Run a model on proportions (without generations)
-
-prop.of.clust <- sapply(names(clust), function(x) {
-  if (x %in% clust_summary$name) return(clust_summary$number_clust_muts[clust_summary$name == x] / sum(Y[x,c(1:112)]))
-  else return(0)
-})
-
-simplemodel <- glm( prop.of.clust ~ 0 + .,data = cd1, family = gaussian())
-coef(summary(simplemodel))
-which(p.adjust(coef(summary(simplemodel))[,4], method = 'BH')<0.05)
-
-coeffs <- coef(summary(simplemodel))
-
-pvclust <- NULL
-for (zzz in rownames(coeffs)[-1]) {
-  stat_mu = coeffs[zzz,1] - coeffs['N2.Rad',1]
-  stat_sd = sqrt(coeffs[zzz,2]**2 + coeffs['N2.Rad',2]**2)
-  zscore = stat_mu / stat_sd
-  pvclust <- c(pvclust, 1 - pchisq(q = zscore**2, df = 1))
-}
-rownames(coeffs)[-1][which(p.adjust(pvclust,method='BH') < 0.05)]
-
-prop.rates <- coeffs[,1]
-prop.rates.sd <- coeffs[,2]
-
-# Visualize
-# no. of clusters
-set.seed(111)
-par(mfrow = c(1,2))
-boxplot(rates*80, frame = F, outline = F, ylim = c(0,max(rates*80+1.96*rates.sd*80)),
-        ylab = 'No. of clusters per 80 Gy', main = 'Clusters per 80 Gy')
-newx <- jitter(rep(1, length(rates)), amount = 0.1)
-points(x = newx, y = rates*80, col = 'gray', pch = 16) 
-#o <- which(p.adjust(pvclust,method='BH') < 0.1)
-points(x = newx[1], y = rates[1]*80, col = 'darkred', pch = 16) 
-#points(x = newx[o+1], y = rates[o+1], col = 'darkred', pch = 16) 
-arrows(x0 = newx[1], 
-       y0 = rates[1]*80 - 1.96*80*rates.sd[1], y1 = rates[1]*80 + 1.96*80*rates.sd[1],
-       col = 'gray21',lwd=0.5,length=0)
-abline(h = 80*rates['N2.Rad'], lty = 2)
-#text(x = c(newx[o+1][1] - 0.2, newx[o+1][-1] + 0.2), y = rates[o+1], font = 3,
-#     labels = names(rates)[o+1], cex = 0.7)
-text(x = c(newx[which(rates > 2 * rates['N2.Rad'])] - 0.2), 
-     y = 80*rates[which(rates > 2 * rates['N2.Rad'])], font = 3,
-     labels = names(which(rates > 2 * rates['N2.Rad'])), cex = 0.7)
-# proportion of clustered muts
-boxplot(prop.rates, frame = F, outline = F, ylim = c(0,max(prop.rates+1.96*prop.rates.sd)),
-        ylab = 'Prop. of clustered mut-s', main = 'Proportion of clustered mutations\n across genotypes')
-newx2 <- jitter(rep(1, length(prop.rates)), amount = 0.1)
-points(x = newx2, y = prop.rates, col = 'gray', pch = 16) 
-#o2 <- which(p.adjust(pvprop,method='BH') < 0.1)
-points(x = newx2[1], y = prop.rates[1], col = 'darkred', pch = 16) 
-arrows(x0 = newx2[1],y0 = prop.rates[1] - 1.96*prop.rates.sd[1],
-       y1=prop.rates[1]+1.96*prop.rates.sd[1],
-       col = 'gray21',lwd=0.5,length=0)
-abline(h = prop.rates['N2.Rad'], lty = 2)
-#text(x = c(newx2[o2+1][1] - 0.2, newx2[o2+1][c(2:3)] + 0.22,newx2[o2+1][4] - 0.2,newx2[o2+1][5] - 0.25,newx2[o2+1][6:7] - 0.2),
-#     y = prop.rates[o2+1], font = 3,
-#     labels = print_names[sapply(names(prop.rates)[o2+1], function(x) grep(x,names(print_names))[1])],
-#     cex = 0.7)
-text(x = newx2[which(prop.rates > 2 * prop.rates['N2.Rad'])],
-     y = prop.rates[which(prop.rates > 2 * prop.rates['N2.Rad'])], font = 3,
-     labels = names(which(prop.rates > 2 * prop.rates['N2.Rad'])),
-     cex = 0.7)
-legend('topright', legend = 'significantly different\n from N2 (FDR 5%)', fill = 'darkred',bty = 'n',
-       border = NA, cex = 0.7)
-
-
-allclust <- do.call('rbind',huge_tot)
-allclust <- allclust[allclust$clust>1,]
-
-CD2Mutant.reduced <- sapply(CD2Mutant, function(x) {
-  tmp <- unlist(strsplit(x, split = '[:]'))
-  if (length(tmp) == 2) return(x)
-  else return(paste(tmp[1:3],collapse=':'))
-})
-
-clust_summary <- data.frame(name = unique(allclust$Sample))
-clust_summary$name <- as.character(clust_summary$name)
-clust_summary$generation <- data$Generation[match(clust_summary$name,data$Sample)]
-clust_summary$genotype <- data$Genotype.new[match(clust_summary$name,data$Sample)]
-clust_summary$exposure <- data$Mutagen[match(clust_summary$name,data$Sample)]
-clust_summary$dose <- data$Drug.concentration[match(clust_summary$name,data$Sample)]
-clust_summary$code <- CD2Mutant.reduced[match(clust_summary$name,names(CD2Mutant.reduced))]
-
-clust_summary$number_of_clusters <- sapply(clust_summary$name, function(x) sum(diff(allclust$start[allclust$Sample == x])>1000) + 1)
-clust_summary$number_clust_muts <- sapply(clust_summary$name, function(x) sum(allclust$Sample == x))
-clust_summary$total_samples_of_this_code <- sapply(clust_summary$code, function(x) sum(CD2Mutant.reduced == x))
-clust_summary$total_mutations_in_sample <- sapply(clust_summary$name, function(x) sum(Y[x,1:112]))
-
-clust_summary_mut <- clust_summary[!is.na(clust_summary$dose),]
-clust_summary_mut <- clust_summary_mut[!(clust_summary_mut$exposure == 'Protonbeam'),]
-
-################################################################################################################
-################################### now some stats #############################################################
 
 clust <- sapply(rownames(Y)[which(data$Drug.concentration[match(rownames(Y),data$Sample)]>0)], function(x) {
   if (x %in% clust_summary_mut$name) return(clust_summary_mut$number_of_clusters[clust_summary_mut$name == x])
@@ -569,8 +413,6 @@ generation.function <- function(N) {
 
 CD2Mutant.very.reduced <- sapply(CD2Mutant[names(clust)], function(x) {
   tmp <- unlist(strsplit(x, split = '[:]'))
-  #if (length(tmp) == 2 | tmp[1] == 'N2') return('non')
-  #else 
   return(paste(tmp[1:2],collapse=':'))
 })
 
@@ -672,7 +514,6 @@ for (zzz in names(prop.rates)[-1]) {
 }
 which(p.adjust(pvprop_ind,method='BH') < 0.05)
 
-
 #################################################################
 
 # Visualize
@@ -710,9 +551,6 @@ o2 <- which(p.adjust(pvprop,method='BH') < 0.1)
 #       col = 'gray21',lwd=0.5,length=0)
 legend('topright', legend = c('IR mutation clustering in wildtype','significantly different\n from wildtype (FDR 10%)'), col = c('black','darkred'),
                               pch = 16, bty = 'n',border = NA, cex = 0.7)
-
-
-
 
 # Distributions of cluster sizes and genomic span
 number_per_cluster <- list()
@@ -762,16 +600,15 @@ names(cluster_sizes)[45] <- 'bub-3 (ok3437)'
 names(cluster_sizes)[23] <- 'tdpo-1'
 
 library(beeswarm)
-
-# Mutations per cluster across genotypes
+pdf('Mutations_per_cluster_across_genotypes.pdf',10,6)
 par(mar = c(10,4,4,2))
 beeswarm(number_per_cluster[correct_order], las = 2, bty = 'n', method = 'hex', ylab = 'Number of mutations / cluster',
          ylim = c(0,10), cex = 0.5, pch = 16, corral = 'gutter', main = 'Sizes of IR-induced clusters across genotypes (muts)',
          xaxt = 'n')
 axis(side = 1, at = c(1:length(correct_order)), labels = names(number_per_cluster)[correct_order], 
      font = 3, las = 2, lty = 0)
-
-# Cluster span across genotypes
+dev.off()
+pdf('Cluster_span_across_genotypes.pdf',10,6)
 par(mar = c(10,4,4,2))
 boxplot(cluster_sizes[correct_order], las = 2, frame = F, xaxt = 'n',
         main = 'Sizes of IR-induced clusters across genotypes (bps)',
@@ -783,3 +620,5 @@ beeswarm(cluster_sizes[correct_order], las = 2, bty = 'n', method = 'hex',
          ylab = 'bp spanned by cluster', col = 'gray56', add = T, 
          ylim = c(0,200), cex = 0.5, pch = 16, corral = 'gutter', 
          main = 'Sizes of IR-induced clusters across genotypes (bps)')
+dev.off()
+
