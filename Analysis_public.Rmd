@@ -29,7 +29,7 @@ CD2Mutant <- sapply(1:nrow(data), function(i) ifelse(is.na(data$Mutagen[i]),
           substr(data$Mutagen[i],1,3),
           data$Drug.concentration[i],
           data$Generation[i],sep=":"),
-    paste(data$Genotype[i], data$Generation[i], sep = ":"))
+    paste(data$Genotype[i], data$Generation[i], sep = ":")))
 names(CD2Mutant) <- data$Sample
 worms <- names(CD2Mutant)
 worms <- sort(worms)
